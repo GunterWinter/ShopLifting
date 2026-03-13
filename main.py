@@ -1352,6 +1352,112 @@ def filter_contained_boxes(items, iou_min_thresh=0.6):
 
 
 # ─────────────────────────────────────────────────────────────
+# SAHI — Slicing Aided Hyper Inference
+#
+# Chia frame thành các tile có overlap, chạy YOLO predict() trên
+# từng tile, dịch toạ độ về full-frame rồi gộp bằng NMS.
+# Cải thiện đáng kể khả năng detect vật thể nhỏ.
+#
+# Args:
+#   model       : YOLO model (det_model)
+#   frame       : full BGR frame
+#   target_cls  : set of class names cần detect (ví dụ {"item"})
+#                 None = detect tất cả class
+#   slice_h/w   : kích thước mỗi tile (pixel)
+#   overlap     : tỷ lệ overlap giữa các tile (0.0-0.5)
+#   conf        : confidence threshold
+#   imgsz       : imgsz truyền vào YOLO
+#   nms_iou     : IoU threshold cho NMS gộp tile
+#   merge_full  : nếu True, cũng chạy predict trên full-frame và gộp lại
+# ─────────────────────────────────────────────────────────────
+def sahi_infer(model, frame, target_cls=None,
+               slice_h=320, slice_w=320, overlap=0.2,
+               conf=0.1, imgsz=640, nms_iou=0.5,
+               merge_full=False):
+    """
+    Trả về list of dict:
+        {"bbox": np.array([x1,y1,x2,y2]), "conf": float, "cls_id": int, "cls_name": str}
+    """
+    H, W = frame.shape[:2]
+    raw: list = []   # [x1, y1, x2, y2, conf, cls_id]
+
+    # ── Tạo danh sách vị trí các tile ──────────────────────────
+    def _tile_starts(dim_size, tile_size, ov):
+        stride = max(1, int(tile_size * (1.0 - ov)))
+        starts = list(range(0, dim_size - tile_size + 1, stride))
+        # Đảm bảo tile cuối luôn cover đến cạnh frame
+        last   = max(0, dim_size - tile_size)
+        if not starts or starts[-1] < last:
+            starts.append(last)
+        return starts
+
+    slice_h = min(slice_h, H)
+    slice_w = min(slice_w, W)
+
+    ys = _tile_starts(H, slice_h, overlap)
+    xs = _tile_starts(W, slice_w, overlap)
+
+    names = model.names or {}
+    if target_cls is not None:
+        target_ids = {cid for cid, cname in names.items()
+                      if str(cname).lower() in target_cls}
+    else:
+        target_ids = None
+
+    # ── Chạy predict trên từng tile ────────────────────────────
+    def _run_on_roi(roi, ox, oy):
+        res = model.predict(roi, imgsz=imgsz, conf=conf, verbose=False)
+        if not res or res[0].boxes is None or len(res[0].boxes) == 0:
+            return
+        r = res[0]
+        for i in range(len(r.boxes)):
+            cid = int(r.boxes.cls[i].cpu())
+            if target_ids is not None and cid not in target_ids:
+                continue
+            bx1, by1, bx2, by2 = r.boxes.xyxy[i].cpu().numpy()
+            raw.append([
+                float(bx1 + ox), float(by1 + oy),
+                float(bx2 + ox), float(by2 + oy),
+                float(r.boxes.conf[i].cpu()),
+                cid,
+            ])
+
+    for y0 in ys:
+        y1_tile = min(y0 + slice_h, H)
+        for x0 in xs:
+            x1_tile = min(x0 + slice_w, W)
+            tile    = frame[y0:y1_tile, x0:x1_tile]
+            _run_on_roi(tile, x0, y0)
+
+    # ── Tuỳ chọn: gộp thêm kết quả từ full-frame ───────────────
+    if merge_full:
+        _run_on_roi(frame, 0, 0)
+
+    if not raw:
+        return [], names
+
+    # ── NMS để loại bỏ duplicate giữa các tile ─────────────────
+    boxes_xywh = [[d[0], d[1], d[2] - d[0], d[3] - d[1]] for d in raw]
+    scores     = [d[4] for d in raw]
+
+    keep_idx = cv2.dnn.NMSBoxes(boxes_xywh, scores, conf, nms_iou)
+    if len(keep_idx) == 0:
+        return [], names
+
+    keep_idx = keep_idx.flatten()
+    result   = []
+    for idx in keep_idx:
+        d = raw[idx]
+        result.append({
+            "bbox":     np.array([d[0], d[1], d[2], d[3]], dtype=float),
+            "conf":     d[4],
+            "cls_id":   d[5],
+            "cls_name": str(names.get(d[5], d[5])),
+        })
+    return result, names
+
+
+# ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -1413,6 +1519,19 @@ def main():
     ap.add_argument("--draw_items",      action="store_true")
     ap.add_argument("--draw_fps",        action="store_true")
     ap.add_argument("--draw_carry_ring", action="store_true")
+    # ── SAHI (Slicing Aided Hyper Inference) ──────────────────
+    ap.add_argument("--sahi",            action="store_true", default=False,
+                    help="Bật SAHI: chia frame thành tile nhỏ để detect vật thể nhỏ tốt hơn.")
+    ap.add_argument("--sahi_slice_h",    type=int,   default=320,
+                    help="Chiều cao mỗi tile SAHI (pixel, default=320).")
+    ap.add_argument("--sahi_slice_w",    type=int,   default=320,
+                    help="Chiều rộng mỗi tile SAHI (pixel, default=320).")
+    ap.add_argument("--sahi_overlap",    type=float, default=0.2,
+                    help="Tỷ lệ overlap giữa các tile SAHI (0.0-0.5, default=0.2).")
+    ap.add_argument("--sahi_nms_iou",    type=float, default=0.5,
+                    help="IoU threshold khi gộp kết quả các tile bằng NMS (default=0.5).")
+    ap.add_argument("--sahi_merge_full", action="store_true", default=False,
+                    help="Nếu bật, cũng chạy thêm predict trên full-frame rồi gộp lại (tốt hơn cho vật thể lớn lẫn nhỏ).")
     args = ap.parse_args()
 
     src = args.rtsp if args.rtsp else args.video
@@ -1604,45 +1723,99 @@ def main():
             det_iv = 1.0 / args.det_fps if args.det_fps > 0 else 0.0
             if det_iv == 0.0 or now >= next_det_ts:
                 next_det_ts = now + det_iv
-                try:
-                    dres = det_model.track(clean_frame, imgsz=args.imgsz, conf=args.conf_det,
-                                           persist=True, verbose=False, iou=0.3)
-                except Exception:
-                    dres = det_model.predict(clean_frame, imgsz=args.imgsz,
-                                             conf=args.conf_det, verbose=False)
 
                 items_raw = []
                 role_dets = []
 
-                if dres:
-                    r = dres[0]
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        boxes = r.boxes.xyxy.cpu().numpy()
-                        confs = r.boxes.conf.cpu().numpy()
-                        clss  = r.boxes.cls.cpu().numpy().astype(int)
-                        names = r.names or {}
-                        tids  = (r.boxes.id.cpu().numpy().astype(int)
-                                 if r.boxes.id is not None else [None] * len(boxes))
-                        for i in range(len(boxes)):
-                            name  = str(names.get(int(clss[i]), clss[i]))
-                            lname = name.lower()
-                            bbox  = boxes[i].astype(float)
-                            cx, cy = xyxy_center(bbox)
-                            conf_val = float(confs[i])
-                            if lname in ROLE_CLASSES:
-                                # Staff/guest need higher confidence to avoid
-                                # confusion between the two classes
-                                if conf_val >= args.conf_role:
-                                    role_dets.append({"bbox": bbox, "name": lname,
-                                                      "conf": conf_val})
-                            elif lname == "item":
-                                items_raw.append({
-                                    "bbox":     bbox,
-                                    "center":   (cx, cy),
-                                    "conf":     conf_val,
-                                    "name":     name,
-                                    "track_id": tids[i],
-                                })
+                if args.sahi:
+                    # ── SAHI path ──────────────────────────────────────────
+                    # 1. Chạy SAHI trên các tile nhỏ để detect "item" (vật thể nhỏ)
+                    sahi_dets, det_names = sahi_infer(
+                        model      = det_model,
+                        frame      = clean_frame,
+                        target_cls = {"item"},
+                        slice_h    = args.sahi_slice_h,
+                        slice_w    = args.sahi_slice_w,
+                        overlap    = args.sahi_overlap,
+                        conf       = args.conf_det,
+                        imgsz      = args.imgsz,
+                        nms_iou    = args.sahi_nms_iou,
+                        merge_full = args.sahi_merge_full,
+                    )
+                    for sd in sahi_dets:
+                        bbox   = sd["bbox"]
+                        cx, cy = xyxy_center(bbox)
+                        items_raw.append({
+                            "bbox":     bbox,
+                            "center":   (cx, cy),
+                            "conf":     sd["conf"],
+                            "name":     sd["cls_name"],
+                            "track_id": None,   # SAHI dùng predict(), StableItemTracker tự gán ID
+                        })
+
+                    # 2. Chạy full-frame predict() để lấy staff/guest (role_dets)
+                    #    Người/role thường to → không cần SAHI, chỉ cần full-frame
+                    try:
+                        rdres = det_model.track(clean_frame, imgsz=args.imgsz, conf=args.conf_det,
+                                                persist=True, verbose=False, iou=0.3)
+                    except Exception:
+                        rdres = det_model.predict(clean_frame, imgsz=args.imgsz,
+                                                  conf=args.conf_det, verbose=False)
+                    if rdres:
+                        r = rdres[0]
+                        if r.boxes is not None and len(r.boxes) > 0:
+                            boxes_ff = r.boxes.xyxy.cpu().numpy()
+                            confs_ff = r.boxes.conf.cpu().numpy()
+                            clss_ff  = r.boxes.cls.cpu().numpy().astype(int)
+                            names_ff = r.names or {}
+                            for i in range(len(boxes_ff)):
+                                lname = str(names_ff.get(int(clss_ff[i]), clss_ff[i])).lower()
+                                if lname in ROLE_CLASSES:
+                                    if float(confs_ff[i]) >= args.conf_role:
+                                        role_dets.append({
+                                            "bbox": boxes_ff[i].astype(float),
+                                            "name": lname,
+                                            "conf": float(confs_ff[i]),
+                                        })
+
+                else:
+                    # ── Standard path (không dùng SAHI) ───────────────────
+                    try:
+                        dres = det_model.track(clean_frame, imgsz=args.imgsz, conf=args.conf_det,
+                                               persist=True, verbose=False, iou=0.3)
+                    except Exception:
+                        dres = det_model.predict(clean_frame, imgsz=args.imgsz,
+                                                 conf=args.conf_det, verbose=False)
+
+                    if dres:
+                        r = dres[0]
+                        if r.boxes is not None and len(r.boxes) > 0:
+                            boxes = r.boxes.xyxy.cpu().numpy()
+                            confs = r.boxes.conf.cpu().numpy()
+                            clss  = r.boxes.cls.cpu().numpy().astype(int)
+                            names = r.names or {}
+                            tids  = (r.boxes.id.cpu().numpy().astype(int)
+                                     if r.boxes.id is not None else [None] * len(boxes))
+                            for i in range(len(boxes)):
+                                name  = str(names.get(int(clss[i]), clss[i]))
+                                lname = name.lower()
+                                bbox  = boxes[i].astype(float)
+                                cx, cy = xyxy_center(bbox)
+                                conf_val = float(confs[i])
+                                if lname in ROLE_CLASSES:
+                                    # Staff/guest need higher confidence to avoid
+                                    # confusion between the two classes
+                                    if conf_val >= args.conf_role:
+                                        role_dets.append({"bbox": bbox, "name": lname,
+                                                          "conf": conf_val})
+                                elif lname == "item":
+                                    items_raw.append({
+                                        "bbox":     bbox,
+                                        "center":   (cx, cy),
+                                        "conf":     conf_val,
+                                        "name":     name,
+                                        "track_id": tids[i],
+                                    })
 
                 items_raw = filter_contained_boxes(items_raw, iou_min_thresh=0.6)
 
