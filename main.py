@@ -1,25 +1,3 @@
-# Features:
-#   1. Zone-based goods theft detection (GoodsZoneGuard)
-#   2. Concealment detection — ZONE-ONLY, guest-only, snapshot-at-carry
-#   3. Staff/Guest role labeling
-#      [NEW] Sliding-window role confirmation: only 2 detections (non-consecutive)
-#            within candidate_window_s seconds needed to confirm a role.
-#            Label sticks; only switches if the new role also gets enough hits.
-#   4. Home Assistant: ONE sensor per goods zone only
-#   5. [NEW] Pinned zone items: bbox+ID displayed forever while in zone,
-#            even when occluded. Only removed after theft confirmed.
-#
-# ── CHANGE LOG ─────────────────────────────────────────────────────────────
-#   [FIX] PersonRoleTracker: sliding-window confirmation (confirm_count=2,
-#         candidate_window_s=8s) → works even with intermittent det_model
-#   [FIX] StableItemTracker: items inside goods zones are "pinned" →
-#         their bbox+ID is displayed FOREVER (infinite ghost TTL) until:
-#           a) re-detected after person leaves (still there → keep)
-#           b) explicitly removed by remove_zone_ghosts() after theft confirmed
-#         Non-zone items keep the normal ghost_ttl behaviour
-#   [KEEP] All other logic unchanged (concealment, GoodsZoneGuard, HA, etc.)
-# ────────────────────────────────────────────────────────────────────────────
-
 import os, json, time, argparse, subprocess, threading, re, collections
 import cv2
 import numpy as np
@@ -1486,8 +1464,8 @@ def main():
     ap.add_argument("--move_thresh",  type=int,   default=18)
     ap.add_argument("--grasp_dist",   type=int,   default=24)
     ap.add_argument("--conceal_verify_sec", type=float, default=1.2)
-    ap.add_argument("--cooldown_sec", type=float, default=1.5)
-    ap.add_argument("--exit_settle_sec", type=float, default=2.5)
+    ap.add_argument("--cooldown_sec", type=float, default=3)
+    ap.add_argument("--exit_settle_sec", type=float, default=0.5)
     ap.add_argument("--goods_zone_names", default="zone1,zone2")
     ap.add_argument("--guest_reach_dist", type=int, default=55)
     ap.add_argument("--unknown_as_guest", action="store_true", default=False)
