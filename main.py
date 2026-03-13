@@ -295,6 +295,33 @@ def bbox_contains_point(bbox, pt):
     x1, y1, x2, y2 = bbox
     return x1 <= pt[0] <= x2 and y1 <= pt[1] <= y2
 
+def expand_bbox(bbox, margin):
+    x1, y1, x2, y2 = bbox
+    m = float(margin)
+    return (x1 - m, y1 - m, x2 + m, y2 + m)
+
+def bbox_overlaps_zone(bbox, zone_pts, margin=0.0):
+    bb = expand_bbox(bbox, margin) if margin else bbox
+    x1, y1, x2, y2 = bb
+    sample_pts = [
+        ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+        (x1, y1), (x2, y1), (x1, y2), (x2, y2),
+        ((x1 + x2) / 2.0, y1), ((x1 + x2) / 2.0, y2),
+        (x1, (y1 + y2) / 2.0), (x2, (y1 + y2) / 2.0),
+    ]
+    return any(point_in_poly(pt, zone_pts) for pt in sample_pts)
+
+def role_det_present_in_zone(role_detections, zone_pts, role_name=None, margin=0.0):
+    want = role_name.lower() if isinstance(role_name, str) else None
+    for rd in role_detections or []:
+        name = str(rd.get("name", "")).lower()
+        if want is not None and name != want:
+            continue
+        bbox = rd.get("bbox")
+        if bbox is not None and bbox_overlaps_zone(bbox, zone_pts, margin=margin):
+            return True
+    return False
+
 def norm_name(s):
     return str(s).strip().lower().replace(" ", "")
 
@@ -400,6 +427,9 @@ class PersonRoleTracker:
                  max_age_s: float      = 3.0,
                  person_match_iou: float    = 0.15,
                  person_match_center: float = 120.0,
+                 switch_confirm_count=None,
+                 switch_min_conf: float = 0.78,
+                 switch_margin: int = 2,
                  # legacy kwargs kept so old call-sites don't break
                  confirm_frames: int   = 2,
                  history_len: int      = 10,
@@ -410,6 +440,9 @@ class PersonRoleTracker:
         self.max_age_s            = max_age_s
         self.person_match_iou     = person_match_iou
         self.person_match_center  = person_match_center
+        self.switch_confirm_count = int(switch_confirm_count) if switch_confirm_count is not None else max(int(confirm_count) + 2, 6)
+        self.switch_min_conf      = float(switch_min_conf)
+        self.switch_margin        = int(switch_margin)
         self._tracks: list        = []
         self._next_track_id: int  = 1
 
@@ -528,15 +561,23 @@ class PersonRoleTracker:
             if best_role is not None:
                 cur       = track["confirmed_role"]
                 cur_count = role_counts.get(cur, 0)
-                # Confirm/switch only if:
-                #   - currently unknown  (first confirmation), OR
-                #   - new role has strictly more hits than current confirmed role
-                if cur == "unknown" or best_count > cur_count:
-                    if cur != best_role and cur != "unknown":
-                        print(f"[ROLE] track#{track['track_id']} "
-                              f"{cur} -> {best_role} (hits={best_count})")
+                best_avg_conf = role_conf_sums[best_role] / max(1, best_count)
+
+                if cur == "unknown":
                     track["confirmed_role"] = best_role
-                    track["confirmed_conf"] = role_conf_sums[best_role] / best_count
+                    track["confirmed_conf"] = best_avg_conf
+                elif cur == best_role:
+                    track["confirmed_conf"] = best_avg_conf
+                else:
+                    enough_hits   = best_count >= self.switch_confirm_count
+                    enough_margin = best_count >= (cur_count + self.switch_margin)
+                    enough_conf   = best_avg_conf >= self.switch_min_conf
+                    if enough_hits and enough_margin and enough_conf:
+                        print(f"[ROLE] track#{track['track_id']} "
+                              f"{cur} -> {best_role} "
+                              f"(hits={best_count}, avg_conf={best_avg_conf:.2f})")
+                        track["confirmed_role"] = best_role
+                        track["confirmed_conf"] = best_avg_conf
 
             p["role"]      = track["confirmed_role"]
             p["role_conf"] = track["confirmed_conf"]
@@ -698,11 +739,13 @@ class StableItemTracker:
 class GoodsZoneGuard:
     IDLE           = 0
     GUEST_INTERACT = 1
-    COOLDOWN       = 2
-    ALERT          = 3
+    OCCLUDED_HOLD  = 2
+    COOLDOWN       = 3
+    ALERT          = 4
 
-    COOLDOWN_SEC  = 1.5
-    ALERT_DISPLAY = 10.0
+    EXIT_SETTLE_SEC = 2.5
+    COOLDOWN_SEC    = 1.5
+    ALERT_DISPLAY   = 10.0
 
     def __init__(self, name):
         self.name  = name
@@ -715,13 +758,8 @@ class GoodsZoneGuard:
         self.missing   = 0
         self.had_guest_contact           = False
         self.staff_touched_during_window = False
-        # Staff item-change tracking
         self._staff_in_zone: bool     = False
         self.staff_reset_needed: bool = False
-        # After a guest/guest-like person leaves the zone, only start the
-        # disappearance timer when the zone is actually clear of blockers
-        # (staff, or unknown when unknown_as_guest=False). This prevents
-        # false alerts caused by someone else still occluding the item.
         self._cooldown_max_raw: int       = 0
         self._cooldown_clear_since: float = 0.0
         self._events: list                = []
@@ -746,6 +784,7 @@ class GoodsZoneGuard:
         self.staff_touched_during_window = False
         self._cooldown_max_raw           = 0
         self._cooldown_clear_since       = 0.0
+        self.exit_ts                     = 0.0
 
     def _go_idle(self, count: int, discard_snapshot: bool = True):
         self.state = self.IDLE
@@ -754,6 +793,12 @@ class GoodsZoneGuard:
         self._reset_window()
         if discard_snapshot:
             self._emit("discard_snapshot")
+
+    def _start_cooldown(self, now: float):
+        self.exit_ts = now
+        self._cooldown_max_raw = 0
+        self._cooldown_clear_since = 0.0
+        self.state = self.COOLDOWN
 
     def force_rebaseline(self, raw_item_count: int):
         """Called by main loop after staff leaves zone.
@@ -770,21 +815,23 @@ class GoodsZoneGuard:
     def update(self, guest_interacting: bool, stable_item_count: int,
                now: float, staff_interacting: bool = False,
                raw_item_count: int = None,
-               cooldown_blocked: bool = False):
+               cooldown_blocked: bool = False,
+               guest_present: bool = False,
+               staff_present: bool = False,
+               unknown_present: bool = False):
         stable_item_count = int(stable_item_count)
         check_count = int(raw_item_count) if raw_item_count is not None else stable_item_count
 
-        # ── Staff enter/leave detection ──────────────────────────────────
-        # Staff has authority to refresh the zone, but ONLY after entering
-        # and then leaving the zone. Merely being seen elsewhere must not
-        # destroy pinned items.
-        staff_just_left = self._staff_in_zone and not bool(staff_interacting)
+        zone_occupied = bool(guest_present or staff_present or unknown_present or cooldown_blocked)
+
+        staff_now_present = bool(staff_present or staff_interacting)
+        staff_just_left = self._staff_in_zone and not staff_now_present
         if staff_just_left:
             self.staff_reset_needed = True
             self.state = self.IDLE
             self._reset_window()
             self._emit("discard_snapshot")
-        self._staff_in_zone = bool(staff_interacting)
+        self._staff_in_zone = staff_now_present
 
         if self.state == self.IDLE:
             self._update_clear_baseline(stable_item_count)
@@ -795,45 +842,52 @@ class GoodsZoneGuard:
 
         elif self.state == self.GUEST_INTERACT:
             if not guest_interacting:
-                self.exit_ts = now
-                self._cooldown_max_raw = 0
-                self._cooldown_clear_since = 0.0
-                self.state = self.COOLDOWN
+                if zone_occupied:
+                    self.state = self.OCCLUDED_HOLD
+                else:
+                    self._start_cooldown(now)
+
+        elif self.state == self.OCCLUDED_HOLD:
+            if guest_interacting:
+                self.state = self.GUEST_INTERACT
+            elif not zone_occupied:
+                self._start_cooldown(now)
 
         elif self.state == self.COOLDOWN:
             if guest_interacting:
                 self._cooldown_max_raw = 0
                 self._cooldown_clear_since = 0.0
                 self.state = self.GUEST_INTERACT
-            elif cooldown_blocked:
-                # Someone else is still blocking the zone, so keep the
-                # pinned item forever and DO NOT start the disappearance
-                # timer yet.
+            elif zone_occupied:
                 self._cooldown_max_raw = 0
                 self._cooldown_clear_since = 0.0
+                self.state = self.OCCLUDED_HOLD
             else:
-                if self._cooldown_clear_since <= 0.0:
-                    self._cooldown_clear_since = now
-                    self._cooldown_max_raw = check_count
+                if (now - self.exit_ts) < self.EXIT_SETTLE_SEC:
+                    pass
                 else:
-                    self._cooldown_max_raw = max(self._cooldown_max_raw, check_count)
-
-                if (now - self._cooldown_clear_since) >= self.COOLDOWN_SEC:
-                    best_count = self._cooldown_max_raw
-                    diff = self.baseline_count - best_count
-                    if self.had_guest_contact and diff > 0:
-                        self.missing   = diff
-                        self.alert_msg = (
-                            f"GOODS TAKEN [{self.name}]  "
-                            f"guest left zone -> "
-                            f"{self.baseline_count} -> {best_count} items"
-                        )
-                        self.alert_ts = now
-                        self.state    = self.ALERT
-                        self._emit("commit_snapshot")
-                        print(f"[ZONE {self.name}] {self.alert_msg}")
+                    if self._cooldown_clear_since <= 0.0:
+                        self._cooldown_clear_since = now
+                        self._cooldown_max_raw = check_count
                     else:
-                        self._go_idle(stable_item_count)
+                        self._cooldown_max_raw = max(self._cooldown_max_raw, check_count)
+
+                    if (now - self._cooldown_clear_since) >= self.COOLDOWN_SEC:
+                        best_count = self._cooldown_max_raw
+                        diff = self.baseline_count - best_count
+                        if self.had_guest_contact and diff > 0:
+                            self.missing   = diff
+                            self.alert_msg = (
+                                f"GOODS TAKEN [{self.name}]  "
+                                f"guest left zone -> "
+                                f"{self.baseline_count} -> {best_count} items"
+                            )
+                            self.alert_ts = now
+                            self.state    = self.ALERT
+                            self._emit("commit_snapshot")
+                            print(f"[ZONE {self.name}] {self.alert_msg}")
+                        else:
+                            self._go_idle(stable_item_count)
 
         elif self.state == self.ALERT:
             if guest_interacting:
@@ -850,7 +904,7 @@ class GoodsZoneGuard:
     @property
     def is_alerting(self):     return self.state == self.ALERT
     @property
-    def person_blocking(self): return self.state in (self.GUEST_INTERACT, self.COOLDOWN)
+    def person_blocking(self): return self.state in (self.GUEST_INTERACT, self.OCCLUDED_HOLD, self.COOLDOWN)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -860,13 +914,20 @@ class ConcealmentTracker:
     ALERT_DISPLAY = 10.0
 
     def __init__(self, carry_dist=90, carry_frames=3, move_thresh=18,
-                 unknown_as_guest=True):
-        self.carry_dist       = carry_dist
-        self.carry_frames     = carry_frames
-        self.move_thresh      = move_thresh
-        self.unknown_as_guest = unknown_as_guest
-        self._items: dict     = {}
-        self.alerts: list     = []
+                 unknown_as_guest=True, grasp_dist=24,
+                 bbox_grab_margin=8, conceal_verify_sec=1.2,
+                 missing_keepalive_sec=8.0, contact_ttl_sec=1.2):
+        self.carry_dist            = carry_dist
+        self.carry_frames          = carry_frames
+        self.move_thresh           = move_thresh
+        self.unknown_as_guest      = unknown_as_guest
+        self.grasp_dist            = grasp_dist
+        self.bbox_grab_margin      = bbox_grab_margin
+        self.conceal_verify_sec    = conceal_verify_sec
+        self.missing_keepalive_sec = missing_keepalive_sec
+        self.contact_ttl_sec       = contact_ttl_sec
+        self._items: dict          = {}
+        self.alerts: list          = []
 
     def _is_guest(self, role: str) -> bool:
         if role == "guest": return True
@@ -882,39 +943,75 @@ class ConcealmentTracker:
                 return z["pts"]
         return None
 
+    def _zone_presence(self, zone_pts, people, role_detections):
+        guest_present = False
+        staff_present = False
+        human_present = False
+
+        for p in people or []:
+            bbox = p.get("bbox")
+            if bbox is None or not bbox_overlaps_zone(bbox, zone_pts):
+                continue
+            human_present = True
+            role = p.get("role", "unknown")
+            if self._is_guest(role):
+                guest_present = True
+            elif self._is_staff(role):
+                staff_present = True
+
+        for rd in role_detections or []:
+            bbox = rd.get("bbox")
+            if bbox is None or not bbox_overlaps_zone(bbox, zone_pts):
+                continue
+            human_present = True
+            name = str(rd.get("name", "")).lower()
+            if name == "guest":
+                guest_present = True
+            elif name == "staff":
+                staff_present = True
+
+        return guest_present, staff_present, human_present
+
     def update(self, items: list, people: list,
-               goods_zones_px: list, now: float, frame=None):
+               goods_zones_px: list, now: float, frame=None,
+               role_detections=None):
+        role_detections = role_detections or []
         current_ids = {it["track_id"] for it in items
                        if it.get("track_id") is not None}
 
         for it in items:
             tid = it.get("track_id")
-            if tid is None: continue
+            if tid is None:
+                continue
             cx, cy = it["center"]
             item_zone_name = item_in_any_zone(it, goods_zones_px)
             if item_zone_name is None and tid not in self._items:
                 continue
 
             near_wrist   = False
+            strong_near  = False
             carrier_role = "unknown"
             item_zone_pts = None
             if item_zone_name is not None:
                 item_zone_pts = self._get_zone_pts(item_zone_name, goods_zones_px)
-            for p in people:
+            expanded_box = expand_bbox(it["bbox"], self.bbox_grab_margin)
+            best_d2 = None
+            for p in people or []:
+                role = p.get("role", "unknown")
                 for ki in (KP_L_WRIST, KP_R_WRIST):
                     wx, wy = p["kpts"][ki]
                     if not point_valid((wx, wy)):
                         continue
-                    # Goods-zone interaction is wrist-driven only.
-                    # If the item belongs to a goods zone, the wrist must be
-                    # inside that zone before we treat it as a possible grab.
                     if item_zone_pts is not None and not point_in_poly((wx, wy), item_zone_pts):
                         continue
-                    if dist2((cx, cy), (wx, wy)) < self.carry_dist ** 2:
-                        near_wrist   = True
-                        carrier_role = p.get("role", "unknown")
-                        break
-                if near_wrist: break
+                    d2 = dist2((cx, cy), (wx, wy))
+                    if d2 < self.carry_dist ** 2:
+                        near_wrist = True
+                        if best_d2 is None or d2 < best_d2:
+                            best_d2 = d2
+                            carrier_role = role
+                        if d2 <= self.grasp_dist ** 2 or bbox_contains_point(expanded_box, (wx, wy)):
+                            strong_near = True
 
             if tid not in self._items:
                 self._items[tid] = {
@@ -922,8 +1019,11 @@ class ConcealmentTracker:
                     "near_frames":        0,
                     "being_carried":      False,
                     "approach_confirmed": False,
+                    "grab_hint":          False,
                     "carrier_role":       "unknown",
                     "last_seen_ts":       now,
+                    "last_contact_ts":    0.0,
+                    "missing_since":      0.0,
                     "anchor_pos":         (cx, cy),
                     "has_moved":          False,
                     "zone_name":          item_zone_name,
@@ -932,6 +1032,7 @@ class ConcealmentTracker:
             rec = self._items[tid]
             rec["last_seen_ts"] = now
             rec["name"]         = it.get("name", rec["name"])
+            rec["missing_since"] = 0.0
             if item_zone_name is not None:
                 rec["zone_name"] = item_zone_name
 
@@ -939,61 +1040,82 @@ class ConcealmentTracker:
                 rec["near_frames"]        = 0
                 rec["being_carried"]      = False
                 rec["approach_confirmed"] = False
+                rec["grab_hint"]          = False
                 rec["has_moved"]          = False
                 rec["carry_snapshot"]     = None
+                rec["missing_since"]      = 0.0
             elif near_wrist and self._is_guest(carrier_role):
                 if rec["near_frames"] == 0:
                     rec["anchor_pos"]         = (cx, cy)
                     rec["has_moved"]          = False
                     rec["approach_confirmed"] = False
+                    rec["grab_hint"]          = False
                     if rec.get("carry_snapshot") is None and frame is not None:
                         rec["carry_snapshot"] = frame.copy()
                 rec["near_frames"] += 1
-                rec["carrier_role"] = carrier_role
+                rec["carrier_role"]       = carrier_role
+                rec["last_contact_ts"]    = now
+                rec["approach_confirmed"] = True
                 ax, ay = rec["anchor_pos"]
                 if dist2((cx, cy), (ax, ay)) >= self.move_thresh ** 2:
                     rec["has_moved"] = True
-                if rec["has_moved"]:
-                    rec["approach_confirmed"] = True
+                if strong_near or (rec["near_frames"] >= self.carry_frames and rec["has_moved"]):
+                    rec["grab_hint"] = True
                 if rec["near_frames"] >= self.carry_frames and rec["has_moved"]:
                     rec["being_carried"] = True
             else:
                 rec["near_frames"] = max(0, rec["near_frames"] - 1)
                 if rec["near_frames"] == 0:
-                    rec["being_carried"]      = False
-                    rec["has_moved"]          = False
-                    rec["approach_confirmed"] = False
+                    rec["being_carried"] = False
+                    if (now - rec.get("last_contact_ts", 0.0)) > self.contact_ttl_sec:
+                        rec["has_moved"]          = False
+                        rec["approach_confirmed"] = False
+                        rec["grab_hint"]          = False
+                        rec["carry_snapshot"]     = None
+                        rec["missing_since"]      = 0.0
 
         for tid in list(self._items):
             rec = self._items[tid]
             age = now - rec["last_seen_ts"]
             if tid not in current_ids:
                 zone_name = rec.get("zone_name")
-                if (rec.get("approach_confirmed") and
-                        zone_name is not None and
-                        age < 2.0 and
-                        self._is_guest(rec["carrier_role"])):
+                armed = (
+                    rec.get("approach_confirmed") and
+                    rec.get("grab_hint") and
+                    zone_name is not None and
+                    age < self.missing_keepalive_sec and
+                    self._is_guest(rec.get("carrier_role", "unknown"))
+                )
+                if armed:
                     zone_pts = self._get_zone_pts(zone_name, goods_zones_px)
-                    guest_in_zone = False
                     if zone_pts is not None:
-                        guest_in_zone = any(
-                            self._is_guest(p.get("role", "unknown")) and
-                            bool(wrists_inside_zone(p, zone_pts))
-                            for p in people
+                        _guest_present, _staff_present, human_present = self._zone_presence(
+                            zone_pts, people, role_detections
                         )
-                    if not guest_in_zone:
-                        self.alerts.append({
-                            "msg": (f"CONCEALMENT [{zone_name}]: "
-                                    f"[{rec['name']}] id={tid} "
-                                    f"concealed by {rec['carrier_role'].upper()}"),
-                            "ts":        now,
-                            "zone_name": zone_name,
-                            "snapshot":  rec.get("carry_snapshot"),
-                        })
-                        print(f"[CONCEAL] {self.alerts[-1]['msg']}")
-                        rec["approach_confirmed"] = False
-                        rec["being_carried"]      = False
-                if age > 4.0:
+                        if human_present:
+                            rec["missing_since"] = 0.0
+                        else:
+                            if rec.get("missing_since", 0.0) <= 0.0:
+                                rec["missing_since"] = now
+                            elif (now - rec["missing_since"]) >= self.conceal_verify_sec:
+                                self.alerts.append({
+                                    "msg": (f"CONCEALMENT [{zone_name}]: "
+                                            f"[{rec['name']}] id={tid} "
+                                            f"concealed by {rec['carrier_role'].upper()}"),
+                                    "ts":        now,
+                                    "zone_name": zone_name,
+                                    "snapshot":  rec.get("carry_snapshot"),
+                                })
+                                print(f"[CONCEAL] {self.alerts[-1]['msg']}")
+                                rec["approach_confirmed"] = False
+                                rec["grab_hint"]          = False
+                                rec["being_carried"]      = False
+                                rec["missing_since"]      = 0.0
+                                rec["carry_snapshot"]     = None
+                else:
+                    rec["missing_since"] = 0.0
+
+                if age > self.missing_keepalive_sec:
                     del self._items[tid]
 
         self.alerts = [a for a in self.alerts if (now - a["ts"]) < self.ALERT_DISPLAY]
@@ -1240,11 +1362,10 @@ def main():
     ap.add_argument("--det_model",  required=True)
     ap.add_argument("--pose_model", required=True)
     ap.add_argument("--imgsz",     type=int,   default=640)
-    ap.add_argument("--conf_det",  type=float, default=0.4,
+    ap.add_argument("--conf_det",  type=float, default=0.1,
                     help="Confidence threshold for det_model items (default 0.4)")
-    ap.add_argument("--conf_role", type=float, default=0.6,
-                    help="Separate confidence threshold for staff/guest detections "
-                         "(default 0.7). Higher than conf_det to reduce staff↔guest confusion.")
+    ap.add_argument("--conf_role", type=float, default=0.72,
+                    help="Confidence threshold for staff/guest detections. Raise this when staff sometimes flips to guest (default 0.72).")
     ap.add_argument("--conf_pose", type=float, default=0.4)
     ap.add_argument("--ffmpeg_path",  default="ffmpeg")
     ap.add_argument("--ffprobe_path", default="ffprobe")
@@ -1257,7 +1378,10 @@ def main():
     ap.add_argument("--carry_dist",   type=int,   default=40)
     ap.add_argument("--carry_frames", type=int,   default=3)
     ap.add_argument("--move_thresh",  type=int,   default=18)
+    ap.add_argument("--grasp_dist",   type=int,   default=24)
+    ap.add_argument("--conceal_verify_sec", type=float, default=1.2)
     ap.add_argument("--cooldown_sec", type=float, default=1.5)
+    ap.add_argument("--exit_settle_sec", type=float, default=2.5)
     ap.add_argument("--goods_zone_names", default="zone1,zone2")
     ap.add_argument("--guest_reach_dist", type=int, default=55)
     ap.add_argument("--unknown_as_guest", action="store_true", default=False)
@@ -1266,11 +1390,17 @@ def main():
     ap.add_argument("--stable_ghost_ttl",  type=float, default=3.0,
                     help="Ghost TTL for non-zone items only. Zone items are pinned forever.")
     # NEW role-tracker params
-    ap.add_argument("--role_confirm_count", type=int,   default=2,
-                    help="Hits needed within --role_window_s to confirm a role (default 2)")
+    ap.add_argument("--role_confirm_count", type=int,   default=4,
+                    help="Hits needed within --role_window_s to confirm an initial role label.")
     ap.add_argument("--role_window_s",      type=float, default=8.0,
-                    help="Sliding window in seconds for role confirmation (default 8)")
+                    help="Sliding window in seconds for role confirmation.")
     ap.add_argument("--role_iou_thresh",    type=float, default=0.25)
+    ap.add_argument("--role_switch_count",  type=int,   default=7,
+                    help="Hits needed inside the window before switching STAFF↔GUEST.")
+    ap.add_argument("--role_switch_min_conf", type=float, default=0.78,
+                    help="Average confidence needed before switching STAFF↔GUEST.")
+    ap.add_argument("--role_switch_margin", type=int,   default=2,
+                    help="New role must beat the current role by at least this many hits before switching.")
     # Legacy compat — kept so old scripts don't break
     ap.add_argument("--role_confirm_frames", type=int, default=2)
     ap.add_argument("--ha_url",       default="http://192.168.2.245:8123/")
@@ -1306,6 +1436,7 @@ def main():
         if norm_name(zname) in goods_zone_names:
             zg = GoodsZoneGuard(zname)
             zg.COOLDOWN_SEC    = args.cooldown_sec
+            zg.EXIT_SETTLE_SEC = args.exit_settle_sec
             zone_guards[zname] = zg
         else:
             zone_guards[zname] = None
@@ -1314,10 +1445,12 @@ def main():
                             if norm_name(z["name"]) in goods_zone_names]
 
     conceal = ConcealmentTracker(
-        carry_dist       = args.carry_dist,
-        carry_frames     = args.carry_frames,
-        move_thresh      = args.move_thresh,
-        unknown_as_guest = args.unknown_as_guest,
+        carry_dist         = args.carry_dist,
+        carry_frames       = args.carry_frames,
+        move_thresh        = args.move_thresh,
+        unknown_as_guest   = args.unknown_as_guest,
+        grasp_dist         = args.grasp_dist,
+        conceal_verify_sec = args.conceal_verify_sec,
     )
 
     stable_tracker = StableItemTracker(
@@ -1328,14 +1461,19 @@ def main():
     track_buf    = TrackBuffer(ghost_frames=6)
 
     role_tracker = PersonRoleTracker(
-        confirm_count      = args.role_confirm_count,
-        candidate_window_s = args.role_window_s,
-        iou_thresh         = args.role_iou_thresh,
+        confirm_count        = args.role_confirm_count,
+        candidate_window_s   = args.role_window_s,
+        iou_thresh           = args.role_iou_thresh,
+        switch_confirm_count = args.role_switch_count,
+        switch_min_conf      = args.role_switch_min_conf,
+        switch_margin        = args.role_switch_margin,
     )
 
     print(f"[CONFIG] role confirm: {args.role_confirm_count} hits / "
-          f"{args.role_window_s}s window  |  unknown_as_guest={args.unknown_as_guest}")
+          f"{args.role_window_s}s window  |  switch={args.role_switch_count} hits @ avg_conf>={args.role_switch_min_conf:.2f} "
+          f"| unknown_as_guest={args.unknown_as_guest}")
     print(f"[CONFIG] conf_det={args.conf_det} (items)  conf_role={args.conf_role} (staff/guest)")
+    print(f"[CONFIG] zone settle={args.exit_settle_sec}s  verify={args.cooldown_sec}s  conceal_verify={args.conceal_verify_sec}s  grasp_dist={args.grasp_dist}px")
 
     ha = HomeAssistantNotifier(
         ha_url            = args.ha_url,
@@ -1527,11 +1665,12 @@ def main():
 
             # ── Concealment update ─────────────────────────────────────────
             conceal.update(
-                items          = last_det_items_raw,
-                people         = last_pose_people,
-                goods_zones_px = last_goods_zones_px,
-                now            = now,
-                frame          = vis,
+                items           = last_det_items_raw,
+                people          = last_pose_people,
+                goods_zones_px  = last_goods_zones_px,
+                now             = now,
+                frame           = vis,
+                role_detections = last_role_dets,
             )
             carried_ids = conceal.being_carried_ids()
 
@@ -1574,13 +1713,30 @@ def main():
                 if args.unknown_as_guest and unknown_interacting:
                     guest_interacting = True
 
-                # During post-guest verification, staff and non-guest unknown
-                # should block the disappearance timer instead of forcing a
-                # false loss. Staff only triggers a refresh after entering and
-                # then leaving the zone.
-                cooldown_blocked = staff_interacting or (
-                    unknown_interacting and not args.unknown_as_guest
+                guest_present_pose = any(
+                    person_role_is(p, "guest") and bbox_overlaps_zone(p["bbox"], pts)
+                    for p in last_pose_people
                 )
+                staff_present_pose = any(
+                    person_role_is(p, "staff") and bbox_overlaps_zone(p["bbox"], pts)
+                    for p in last_pose_people
+                )
+                unknown_present_pose = any(
+                    person_role_is(p, "unknown") and bbox_overlaps_zone(p["bbox"], pts)
+                    for p in last_pose_people
+                )
+                guest_present_det = role_det_present_in_zone(last_role_dets, pts, role_name="guest")
+                staff_present_det = role_det_present_in_zone(last_role_dets, pts, role_name="staff")
+
+                guest_present = guest_present_pose or guest_present_det
+                staff_present = staff_present_pose or staff_present_det
+                unknown_present = unknown_present_pose and not args.unknown_as_guest
+                if args.unknown_as_guest and unknown_present_pose:
+                    guest_present = True
+
+                # If pose is lost but det_model still sees a guest/staff head/body
+                # in the zone, keep the state on HOLD instead of starting a false alert.
+                cooldown_blocked = staff_present or unknown_present
 
                 guard.update(
                     guest_interacting  = guest_interacting,
@@ -1589,6 +1745,9 @@ def main():
                     staff_interacting  = staff_interacting,
                     raw_item_count     = raw_count,
                     cooldown_blocked   = cooldown_blocked,
+                    guest_present      = guest_present,
+                    staff_present      = staff_present,
+                    unknown_present    = unknown_present,
                 )
 
                 for event_name in guard.pop_events():
@@ -1707,10 +1866,10 @@ def main():
                     lbl += f" {it['conf']:.2f}"
                     (iw, ih), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, _fsi, 1)
                     lx, ly = x1, max(ih + 2, y1 - 2)
-                    cv2.rectangle(vis, (lx, ly-ih-2),
-                                  (min(W-1, lx+iw+4), ly+2), (0,0,0), -1)
-                    cv2.putText(vis, lbl, (lx+2, ly),
-                                cv2.FONT_HERSHEY_SIMPLEX, _fsi, color, 1, cv2.LINE_AA)
+                    # cv2.rectangle(vis, (lx, ly-ih-2),
+                    #               (min(W-1, lx+iw+4), ly+2), (0,0,0), -1)
+                    # cv2.putText(vis, lbl, (lx+2, ly),
+                    #             cv2.FONT_HERSHEY_SIMPLEX, _fsi, color, 1, cv2.LINE_AA)
 
                 for rd in last_role_dets:
                     x1, y1, x2, y2 = [int(v) for v in rd["bbox"]]
