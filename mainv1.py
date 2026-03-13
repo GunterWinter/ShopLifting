@@ -1,24 +1,26 @@
-# Features:
-#   1. Zone-based goods theft detection (GoodsZoneGuard)
-#   2. Concealment detection — ZONE-ONLY, guest-only, snapshot-at-carry
-#   3. Staff/Guest role labeling
-#      [NEW] Sliding-window role confirmation: only 2 detections (non-consecutive)
-#            within candidate_window_s seconds needed to confirm a role.
-#            Label sticks; only switches if the new role also gets enough hits.
-#   4. Home Assistant: ONE sensor per goods zone only
-#   5. [NEW] Pinned zone items: bbox+ID displayed forever while in zone,
-#            even when occluded. Only removed after theft confirmed.
-#
-# ── CHANGE LOG ─────────────────────────────────────────────────────────────
-#   [FIX] PersonRoleTracker: sliding-window confirmation (confirm_count=2,
-#         candidate_window_s=8s) → works even with intermittent det_model
-#   [FIX] StableItemTracker: items inside goods zones are "pinned" →
-#         their bbox+ID is displayed FOREVER (infinite ghost TTL) until:
-#           a) re-detected after person leaves (still there → keep)
-#           b) explicitly removed by remove_zone_ghosts() after theft confirmed
-#         Non-zone items keep the normal ghost_ttl behaviour
-#   [KEEP] All other logic unchanged (concealment, GoodsZoneGuard, HA, etc.)
-# ────────────────────────────────────────────────────────────────────────────
+"""
+Anti-theft monitor for retail / goods-zone environments.
+
+Tổng quan pipeline
+------------------
+1) FFmpeg đọc frame mới nhất từ RTSP/video.
+2) YOLO Pose phát hiện người và keypoints, đặc biệt là cổ tay.
+3) YOLO Detect phát hiện item và role object (staff / guest).
+4) PersonRoleTracker gom các detection role theo sliding window để gán nhãn ổn định.
+5) StableItemTracker giữ item ổn định theo vị trí, hỗ trợ ghost/pinned khi bị che khuất.
+6) GoodsZoneGuard chạy state machine cho từng zone để xác nhận mất hàng.
+7) ConcealmentTracker theo dõi hành vi cầm/mang/che giấu item.
+8) HomeAssistantNotifier gửi sensor/webhook/snapshot/clip sang Home Assistant.
+9) OpenCV render overlay phục vụ vận hành và debug realtime.
+
+Gợi ý debug nhanh
+-----------------
+- Stream lỗi/đứng: xem FFmpegLatestFrameReader.last_err.
+- Role staff/guest không ổn định: xem PersonRoleTracker + conf_role + role window.
+- Đếm item sai trong zone: xem StableItemTracker và baseline của GoodsZoneGuard.
+- Báo concealment sai: xem carry_dist / carry_frames / move_thresh / unknown_as_guest.
+- Có alert nhưng HA im lặng: xem requests, ha_url, token, webhook, snapshot_dir.
+"""
 
 import os, json, time, argparse, subprocess, threading, re, collections
 import cv2
@@ -27,7 +29,6 @@ from ultralytics import YOLO
 
 try:
     import requests as _requests
-
     _HAS_REQUESTS = True
 except ImportError:
     _HAS_REQUESTS = False
@@ -38,38 +39,38 @@ except ImportError:
 # Home Assistant Notifier
 # ─────────────────────────────────────────────────────────────
 class HomeAssistantNotifier:
-    """
-    Centralizes Home Assistant integrations for anti-theft events.
+    """Gửi alert sang Home Assistant và quản lý snapshot/clip.
 
-    This class is responsible for creating per-zone sensors, staging snapshots,
-    saving clips from a rolling frame buffer, and sending state/webhook updates
-    to Home Assistant without changing the detection pipeline logic.
+    Class này chịu trách nhiệm cho side-effect bên ngoài pipeline nhận diện:
+    - tạo sensor entity,
+    - lưu bằng chứng media,
+    - bắn webhook automation,
+    - chống spam bằng cooldown.
     """
     SENSOR_PREFIX = "sensor.antitheft_"
     MAX_SNAPSHOT_FILES = 100
 
     def __init__(self, ha_url, token, zone_names=None, webhook_id="",
                  snapshot_dir="", clip_duration_s=0.0, notify_cooldown_s=15.0):
-        """
-        Initialize the Home Assistant notifier and prepare runtime buffers.
+        """Khởi tạo notifier và chuẩn bị môi trường lưu media.
 
         Args:
-            ha_url: Base URL of the Home Assistant instance.
-            token: Long-lived access token used for REST API calls.
-            zone_names: Goods-zone names that should be exposed as HA sensors.
-            webhook_id: Optional webhook endpoint to trigger on alerts.
-            snapshot_dir: Directory used to store snapshots and clips.
-            clip_duration_s: Rolling clip duration to save per alert.
-            notify_cooldown_s: Minimum interval between repeated notifications.
+            ha_url: URL gốc của Home Assistant.
+            token: Long-lived access token.
+            zone_names: Danh sách zone để tạo sensor ban đầu.
+            webhook_id: Tên webhook để automation HA nghe event.
+            snapshot_dir: Thư mục lưu ảnh/clip alert.
+            clip_duration_s: Độ dài clip buffer cần giữ.
+            notify_cooldown_s: Thời gian chống spam cho cùng entity.
         """
-        self.ha_url = ha_url.rstrip("/")
-        self.webhook_id = webhook_id
-        self.snapshot_dir = snapshot_dir
-        self.clip_duration_s = clip_duration_s
+        self.ha_url            = ha_url.rstrip("/")
+        self.webhook_id        = webhook_id
+        self.snapshot_dir      = snapshot_dir
+        self.clip_duration_s   = clip_duration_s
         self.notify_cooldown_s = notify_cooldown_s
         self._headers = {
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
+            "Content-Type":  "application/json",
         }
         self._last_notify: dict = {}
         self._staged_media: dict = {}
@@ -77,7 +78,7 @@ class HomeAssistantNotifier:
             os.makedirs(snapshot_dir, exist_ok=True)
         self._frame_buf: collections.deque = collections.deque()
         self._frame_buf_lock = threading.Lock()
-        self._clip_buf_sec = max(clip_duration_s, 5.0)
+        self._clip_buf_sec   = max(clip_duration_s, 5.0)
         self._enabled = _HAS_REQUESTS and bool(ha_url) and bool(token)
         if not self._enabled:
             print("[HA] Notifier disabled (missing url/token or requests lib)")
@@ -85,27 +86,17 @@ class HomeAssistantNotifier:
         self._init_sensors(zone_names or [])
 
     def _init_sensors(self, zone_names):
-        """
-        Create and initialize one Home Assistant sensor per configured zone.
-
-        Each zone sensor starts with a neutral state and empty metadata so later
-        alerts can update a stable entity instead of creating new entities.
-        """
+        """Khởi tạo sensor mặc định cho từng goods zone để HA luôn thấy entity tồn tại."""
         for z in zone_names:
             entity_id = self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_",
-                                                    f"zone_{z}".lower())
+                                                     f"zone_{z}".lower())
             attrs = {"friendly_name": f"Anti-Theft Zone: {z}",
                      "message": "", "timestamp": "", "snapshot": "", "clip": ""}
             self._update_sensor(entity_id, "None", attrs)
             print(f"[HA] Initialized sensor -> {entity_id} = None")
 
     def push_frame(self, frame, ts):
-        """
-        Append the latest rendered frame into the rolling clip buffer.
-
-        The buffer is only maintained when clip recording is enabled. Older frames
-        outside the configured time window are pruned immediately.
-        """
+        """Đưa frame vào buffer vòng tròn phục vụ cắt clip trước/sau alert."""
         if self.clip_duration_s <= 0: return
         with self._frame_buf_lock:
             self._frame_buf.append((frame, ts))
@@ -114,13 +105,7 @@ class HomeAssistantNotifier:
                 self._frame_buf.popleft()
 
     def _prune_snapshot_files(self, keep_paths=None):
-        """
-        Enforce the maximum number of retained snapshot files.
-
-        Args:
-            keep_paths: Absolute or relative file paths that must not be deleted
-                during this pruning pass.
-        """
+        """Giới hạn số lượng snapshot trên đĩa để tránh đầy storage."""
         if not self.snapshot_dir:
             return
         keep = {os.path.abspath(p) for p in (keep_paths or []) if p}
@@ -152,28 +137,17 @@ class HomeAssistantNotifier:
             print(f"[HA] Snapshot prune error: {e}")
 
     def _save_snapshot(self, frame, label):
-        """
-        Persist a single JPEG snapshot for the provided event label.
-
-        Returns:
-            str: Absolute or relative path to the saved snapshot, or an empty
-            string when snapshot saving is disabled.
-        """
+        """Lưu một ảnh JPG ra thư mục snapshot."""
         if not self.snapshot_dir or frame is None: return ""
         ts_str = time.strftime("%Y%m%d_%H%M%S")
-        safe = re.sub(r"[^a-zA-Z0-9_]", "_", label)
-        path = os.path.join(self.snapshot_dir, f"{safe}_{ts_str}.jpg")
+        safe   = re.sub(r"[^a-zA-Z0-9_]", "_", label)
+        path   = os.path.join(self.snapshot_dir, f"{safe}_{ts_str}.jpg")
         cv2.imwrite(path, frame)
         self._prune_snapshot_files(keep_paths=[path])
         return path
 
     def stage_snapshot(self, kind, frame):
-        """
-        Capture and cache a pre-alert snapshot for a future event.
-
-        This is used when the system wants evidence from the interaction moment
-        rather than waiting until the final alert is committed.
-        """
+        """Chụp và giữ snapshot tạm ở thời điểm nghi vấn bắt đầu."""
         if not self.snapshot_dir or frame is None:
             return ""
         staged = self._staged_media.get(kind)
@@ -191,9 +165,7 @@ class HomeAssistantNotifier:
         return snap_path
 
     def discard_staged(self, kind):
-        """
-        Remove a staged snapshot that is no longer needed.
-        """
+        """Hủy snapshot tạm nếu sự kiện không thành alert thật."""
         staged = self._staged_media.pop(kind, None)
         if not staged:
             return
@@ -206,13 +178,7 @@ class HomeAssistantNotifier:
                 pass
 
     def _consume_staged_snapshot(self, kind):
-        """
-        Return and clear the staged snapshot for an event kind.
-
-        Returns:
-            str: Existing snapshot path if the file is still present; otherwise
-            an empty string.
-        """
+        """Lấy staged snapshot ra dùng một lần rồi xóa khỏi cache."""
         staged = self._staged_media.pop(kind, None)
         if not staged:
             return ""
@@ -220,31 +186,23 @@ class HomeAssistantNotifier:
         return snap_path if snap_path and os.path.exists(snap_path) else ""
 
     def _save_clip(self, label):
-        """
-        Write the current rolling frame buffer to an MP4 clip.
-
-        Returns:
-            str: Path to the saved clip, or an empty string when clip recording
-            is disabled or the buffer is empty.
-        """
+        """Kết xuất clip MP4 từ frame buffer hiện có."""
         if self.clip_duration_s <= 0 or not self.snapshot_dir: return ""
         with self._frame_buf_lock:
             frames = list(self._frame_buf)
         if not frames: return ""
         ts_str = time.strftime("%Y%m%d_%H%M%S")
-        safe = re.sub(r"[^a-zA-Z0-9_]", "_", label)
-        path = os.path.join(self.snapshot_dir, f"{safe}_{ts_str}.mp4")
-        h, w = frames[0][0].shape[:2]
-        fps = max(1.0, len(frames) / max(0.1, frames[-1][1] - frames[0][1])) if len(frames) > 1 else 10.0
+        safe   = re.sub(r"[^a-zA-Z0-9_]", "_", label)
+        path   = os.path.join(self.snapshot_dir, f"{safe}_{ts_str}.mp4")
+        h, w   = frames[0][0].shape[:2]
+        fps    = max(1.0, len(frames) / max(0.1, frames[-1][1] - frames[0][1])) if len(frames) > 1 else 10.0
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
         for f, _ in frames: writer.write(f)
         writer.release()
         return path
 
     def _update_sensor(self, entity_id, state, attributes):
-        """
-        Push a state update to a Home Assistant sensor entity.
-        """
+        """POST state + attributes vào Home Assistant State API."""
         url = f"{self.ha_url}/api/states/{entity_id}"
         try:
             r = _requests.post(url, headers=self._headers,
@@ -255,9 +213,7 @@ class HomeAssistantNotifier:
             print(f"[HA] Sensor update error: {e}")
 
     def _fire_webhook(self, data):
-        """
-        Trigger the configured Home Assistant webhook with event payload.
-        """
+        """Gửi webhook event phụ sang Home Assistant."""
         if not self.webhook_id: return
         url = f"{self.ha_url}/api/webhook/{self.webhook_id}"
         try:
@@ -269,16 +225,16 @@ class HomeAssistantNotifier:
 
     def send_alert(self, kind, message, frame, now, use_staged_snapshot=False,
                    snapshot_path=""):
-        """
-        Send an anti-theft alert to Home Assistant with media evidence.
+        """Gửi một alert hoàn chỉnh sang Home Assistant.
 
-        Args:
-            kind: Logical alert key, typically aligned with a goods zone.
-            message: Human-readable alert message.
-            frame: Fallback frame used when no staged snapshot is available.
-            now: Unix timestamp for cooldown tracking and metadata.
-            use_staged_snapshot: Whether to prefer a previously staged snapshot.
-            snapshot_path: Explicit snapshot path to use when already prepared.
+        Thứ tự xử lý:
+        1) Chặn spam bằng cooldown.
+        2) Chọn snapshot phù hợp: path có sẵn / staged / chụp mới.
+        3) Tạo clip nếu được bật.
+        4) Update sensor và bắn webhook.
+
+        Nếu debug thấy sensor có alert nhưng thiếu media, hãy kiểm tra thread
+        `_save_media()` và quyền ghi vào `snapshot_dir`.
         """
         if not self._enabled: return
         entity_id = self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_", kind.lower())
@@ -301,8 +257,7 @@ class HomeAssistantNotifier:
             clip_path = self._save_clip(kind)
 
         t = threading.Thread(target=_save_media, daemon=True)
-        t.start();
-        t.join(timeout=10)
+        t.start(); t.join(timeout=10)
         attrs = {
             "friendly_name": f"Anti-Theft: {kind}", "message": message,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
@@ -315,9 +270,7 @@ class HomeAssistantNotifier:
         print(f"[HA] Sent alert -> {entity_id}  snap={snap_path} clip={clip_path}")
 
     def clear_alert(self, kind):
-        """
-        Reset the Home Assistant entity for an alert back to OK state.
-        """
+        """Đưa sensor của alert về trạng thái OK và dọn staged media."""
         self.discard_staged(kind)
         if not self._enabled: return
         entity_id = self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_", kind.lower())
@@ -330,55 +283,32 @@ class HomeAssistantNotifier:
 # Utils
 # ─────────────────────────────────────────────────────────────
 def clamp(v, a, b):
-    """
-    Clamp a numeric value into the inclusive range [a, b].
-    """
+    """Giới hạn giá trị `v` trong đoạn [a, b]."""
     return max(a, min(b, v))
 
-
 def point_in_poly(pt, poly_pts):
-    """
-    Return True when a point lies inside or on the polygon boundary.
-    """
+    """Kiểm tra một điểm có nằm trong polygon không."""
     poly = np.array(poly_pts, dtype=np.int32)
     return cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0
 
-
 def xyxy_center(xyxy):
-    """
-    Compute the center point of a bounding box in XYXY format.
-    """
+    """Tính tâm của bbox dạng [x1, y1, x2, y2]."""
     x1, y1, x2, y2 = xyxy
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
-
 def poly_label_anchor(pts):
-    """
-    Return the top-left anchor used to place a polygon label.
-    """
+    """Lấy mốc gần góc trên-trái để đặt label cho zone polygon."""
     return int(min(p[0] for p in pts)), int(min(p[1] for p in pts))
 
-
 def dist2(a, b):
-    """
-    Return squared Euclidean distance between two 2D points.
+    """Bình phương khoảng cách Euclid giữa 2 điểm.
 
-    Squared distance is used to avoid an unnecessary square-root in repeated
-    proximity checks.
+    Dùng dạng bình phương để tránh sqrt trong loop realtime.
     """
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
 
-
 def load_zones(zones_path):
-    """
-    Load and validate zone definitions from a JSON file.
-
-    Returns:
-        list: Zone dictionaries with normalized structure.
-
-    Raises:
-        ValueError: If the JSON structure is missing required zone fields.
-    """
+    """Đọc zones.json và validate cấu trúc cơ bản của danh sách zone."""
     with open(zones_path, "r", encoding="utf-8") as f:
         zdata = json.load(f)
     zones = zdata.get("zones", [])
@@ -389,22 +319,12 @@ def load_zones(zones_path):
             raise ValueError("Each zone needs 'name' and non-empty 'points'")
     return zones
 
-
 def is_rtsp(src):
-    """
-    Return True when the input source string is an RTSP stream URL.
-    """
+    """Xác định input có phải RTSP URL hay không."""
     return src.lower().startswith("rtsp://")
 
-
 def probe_size_with_ffprobe(src, ffprobe_path="ffprobe", timeout_s=6):
-    """
-    Probe source video dimensions with ffprobe.
-
-    Returns:
-        tuple[int | None, int | None]: Width and height when available;
-        otherwise (None, None).
-    """
+    """Lấy width/height của nguồn video bằng ffprobe."""
     try:
         cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0",
                "-show_entries", "stream=width,height", "-of", "json", src]
@@ -417,65 +337,41 @@ def probe_size_with_ffprobe(src, ffprobe_path="ffprobe", timeout_s=6):
     except Exception:
         return None, None
 
-
 def bbox_iou(b1, b2):
-    """
-    Compute the intersection-over-union score for two bounding boxes.
-    """
-    ix1 = max(b1[0], b2[0]);
-    iy1 = max(b1[1], b2[1])
-    ix2 = min(b1[2], b2[2]);
-    iy2 = min(b1[3], b2[3])
-    iw = max(0.0, ix2 - ix1);
-    ih = max(0.0, iy2 - iy1)
+    """Tính IoU giữa hai bounding box."""
+    ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
+    ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
+    iw  = max(0.0, ix2 - ix1); ih = max(0.0, iy2 - iy1)
     inter = iw * ih
     if inter == 0: return 0.0
-    a1 = max(0, b1[2] - b1[0]) * max(0, b1[3] - b1[1])
-    a2 = max(0, b2[2] - b2[0]) * max(0, b2[3] - b2[1])
+    a1 = max(0, b1[2]-b1[0]) * max(0, b1[3]-b1[1])
+    a2 = max(0, b2[2]-b2[0]) * max(0, b2[3]-b2[1])
     union = a1 + a2 - inter
     return inter / union if union > 0 else 0.0
 
-
 def bbox_contains_point(bbox, pt):
-    """
-    Return True when a 2D point falls inside a bounding box.
-    """
+    """Kiểm tra một điểm có nằm trong bbox không."""
     x1, y1, x2, y2 = bbox
     return x1 <= pt[0] <= x2 and y1 <= pt[1] <= y2
 
-
 def norm_name(s):
-    """
-    Normalize zone or class names for consistent comparisons.
-    """
+    """Chuẩn hóa chuỗi để so sánh tên zone/class ổn định hơn."""
     return str(s).strip().lower().replace(" ", "")
 
-
 def point_valid(pt):
-    """
-    Validate that a keypoint looks initialized and on-screen.
-    """
+    """Kiểm tra keypoint pose có usable hay không."""
     return pt[0] > 1 and pt[1] > 1
 
-
 def items_inside_zone(items, zone_pts):
-    """
-    Filter item detections whose centers fall inside a zone polygon.
-    """
+    """Lọc các item có tâm nằm trong zone."""
     return [it for it in items if point_in_poly(it["center"], zone_pts)]
 
-
 def person_role_is(person, role):
-    """
-    Check whether a person dictionary currently matches a target role.
-    """
+    """Shortcut kiểm tra role hiện tại của person."""
     return person.get("role", "unknown") == role
 
-
 def item_in_any_zone(item, goods_zones_px):
-    """
-    Return the goods-zone name containing the item center, if any.
-    """
+    """Trả tên goods zone đầu tiên chứa item, nếu có."""
     for z in goods_zones_px:
         if point_in_poly(item["center"], z["pts"]):
             return z["name"]
@@ -485,27 +381,23 @@ def item_in_any_zone(item, goods_zones_px):
 # ─────────────────────────────────────────────────────────────
 # Pose skeleton  (COCO-17)
 # ─────────────────────────────────────────────────────────────
-COCO17_EDGES = [(0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-                (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
+COCO17_EDGES = [(0,1),(0,2),(1,3),(2,4),(5,6),(5,7),(7,9),(6,8),(8,10),
+                (5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)]
 
 KP_L_ELBOW, KP_R_ELBOW = 7, 8
 KP_L_WRIST, KP_R_WRIST = 9, 10
 _ARM_KPS = (KP_L_ELBOW, KP_R_ELBOW, KP_L_WRIST, KP_R_WRIST)
 
 ROLE_COLORS = {
-    "staff": (0, 200, 80),
-    "guest": (200, 80, 0),
-    "unknown": (255, 80, 80),
+    "staff":   (0,   200, 80),
+    "guest":   (200, 80,  0),
+    "unknown": (255, 80,  80),
 }
 
-
 def draw_pose_skeleton(vis, kpts, color=(255, 80, 80)):
-    """
-    Render a COCO-17 pose skeleton and visible keypoints on a frame.
-    """
+    """Vẽ skeleton COCO-17 để quan sát pose và debug cổ tay."""
     for a, b in COCO17_EDGES:
-        xa, ya = kpts[a];
-        xb, yb = kpts[b]
+        xa, ya = kpts[a]; xb, yb = kpts[b]
         if xa > 1 and ya > 1 and xb > 1 and yb > 1:
             cv2.line(vis, (int(xa), int(ya)), (int(xb), int(yb)), color, 2, cv2.LINE_AA)
     for x, y in kpts:
@@ -519,12 +411,7 @@ def draw_pose_skeleton(vis, kpts, color=(255, 80, 80)):
 # Body bbox / torso / elbow / shoulder entering the polygon is ignored.
 # ─────────────────────────────────────────────────────────────
 def wrists_inside_zone(person, zone_pts):
-    """
-    Collect wrist keypoints that are valid and inside a zone polygon.
-
-    Returns:
-        list[tuple[float, float]]: Wrist coordinates inside the zone.
-    """
+    """Trả danh sách cổ tay của person đang nằm trong zone."""
     inside = []
     for ki in (KP_L_WRIST, KP_R_WRIST):
         wx, wy = person["kpts"][ki]
@@ -534,13 +421,7 @@ def wrists_inside_zone(person, zone_pts):
 
 
 def person_interacts_with_goods_zone(person, zone_pts, zone_items, reach_dist=55):
-    """
-    Determine whether a person is interacting with a goods zone.
-
-    The interaction model is intentionally wrist-driven: body presence alone is
-    not enough. A wrist entering the zone is sufficient, and visible nearby
-    items are used only as an additional compatibility check.
-    """
+    """Xác định người có đang tương tác goods zone bằng tín hiệu cổ tay."""
     wrists_in_zone = wrists_inside_zone(person, zone_pts)
     if not wrists_in_zone:
         return False
@@ -579,42 +460,34 @@ def person_interacts_with_goods_zone(person, zone_pts, zone_items, reach_dist=55
 #   single stray detections.
 # ─────────────────────────────────────────────────────────────
 class PersonRoleTracker:
-    """
-    Track and stabilize staff/guest role labels across frames.
+    """Theo dõi role staff/guest ổn định theo sliding window.
 
-    The tracker matches live pose detections to lightweight person tracks and
-    confirms roles with a sliding time window rather than consecutive frames,
-    which makes role assignment more tolerant to detector dropouts.
+    Detection role thường chập chờn. Tracker này gom hit theo thời gian thay vì
+    yêu cầu nhiều frame liên tiếp, nhờ đó giảm flicker và đỡ mất role vì blur/occlusion.
     """
-
     def __init__(self,
-                 confirm_count: int = 2,
+                 confirm_count: int    = 2,
                  candidate_window_s: float = 8.0,
-                 iou_thresh: float = 0.25,
-                 max_age_s: float = 3.0,
-                 person_match_iou: float = 0.15,
+                 iou_thresh: float     = 0.25,
+                 max_age_s: float      = 3.0,
+                 person_match_iou: float    = 0.15,
                  person_match_center: float = 120.0,
                  # legacy kwargs kept so old call-sites don't break
-                 confirm_frames: int = 2,
-                 history_len: int = 10,
+                 confirm_frames: int   = 2,
+                 history_len: int      = 10,
                  candidate_ttl_s: float = 1.0):
-        """
-        Configure thresholds and lifetime rules for role tracking.
-        """
-        self.confirm_count = confirm_count
-        self.candidate_window_s = candidate_window_s
-        self.iou_thresh = iou_thresh
-        self.max_age_s = max_age_s
-        self.person_match_iou = person_match_iou
-        self.person_match_center = person_match_center
-        self._tracks: list = []
-        self._next_track_id: int = 1
+        self.confirm_count        = confirm_count
+        self.candidate_window_s   = candidate_window_s
+        self.iou_thresh           = iou_thresh
+        self.max_age_s            = max_age_s
+        self.person_match_iou     = person_match_iou
+        self.person_match_center  = person_match_center
+        self._tracks: list        = []
+        self._next_track_id: int  = 1
 
     # ── Spatial matching helpers (unchanged from original) ──────────────
     def _person_track_score(self, person_bbox, track_bbox):
-        """
-        Score how well a live person bbox matches an existing track.
-        """
+        """Tính điểm match person hiện tại với track cũ bằng IoU + khoảng cách tâm."""
         iou = bbox_iou(person_bbox, track_bbox)
         pcx, pcy = xyxy_center(person_bbox)
         tcx, tcy = xyxy_center(track_bbox)
@@ -625,9 +498,7 @@ class PersonRoleTracker:
         return iou + 0.35 * dist_score
 
     def _match_persons_to_tracks(self, persons):
-        """
-        Greedily assign current people to existing tracks by best score.
-        """
+        """Ghép person frame hiện tại với track nội bộ bằng greedy matching."""
         assignments = [None] * len(persons)
         scores = []
         for pi, p in enumerate(persons):
@@ -640,14 +511,11 @@ class PersonRoleTracker:
         for s, pi, ti in scores:
             if pi not in used_p and ti not in used_t:
                 assignments[pi] = ti
-                used_p.add(pi);
-                used_t.add(ti)
+                used_p.add(pi); used_t.add(ti)
         return assignments
 
     def _role_person_score(self, person_bbox, role_bbox):
-        """
-        Score how well a role detection matches a person bbox.
-        """
+        """Tính điểm match giữa pose-person bbox và detection role bbox."""
         iou = bbox_iou(person_bbox, role_bbox)
         if iou >= self.iou_thresh:
             return iou
@@ -657,9 +525,7 @@ class PersonRoleTracker:
         return None
 
     def _match_role_dets_to_persons(self, persons, role_detections):
-        """
-        Assign staff/guest detections to pose persons using greedy matching.
-        """
+        """Ghép detection role staff/guest vào từng person phù hợp nhất."""
         assignments = [None] * len(persons)
         scores = []
         for ri, rd in enumerate(role_detections):
@@ -672,40 +538,33 @@ class PersonRoleTracker:
         for s, conf, pi, ri in scores:
             if pi not in used_p and ri not in used_r:
                 assignments[pi] = ri
-                used_p.add(pi);
-                used_r.add(ri)
+                used_p.add(pi); used_r.add(ri)
         return assignments
 
     def update(self, persons, role_detections, now):
+        """Cập nhật buffer hiển thị và trả ra danh sách item gồm ghost frame ngắn hạn."""
+        """Cập nhật trạng thái item liên quan tới hành vi carry/concealment."""
+        """Cập nhật state machine zone dựa trên interaction + item count hiện tại."""
+        """Cập nhật registry item; trả về `stable_items` và `real_items`."""
+        """Cập nhật track role cho danh sách person và enrich thêm `role`, `role_conf`."""
         # 1. Match persons to tracks
-        """
-        Update tracks, role evidence, and confirmed role labels.
-
-        Args:
-            persons: Pose-model person detections for the current frame.
-            role_detections: Staff/guest detections from the item model.
-            now: Current timestamp in seconds.
-
-        Returns:
-            list: The input people list enriched with stable role metadata.
-        """
         track_assign = self._match_persons_to_tracks(persons)
         for pi, p in enumerate(persons):
             ti = track_assign[pi]
             if ti is None:
                 self._tracks.append({
-                    "track_id": self._next_track_id,
-                    "bbox": p["bbox"],
+                    "track_id":       self._next_track_id,
+                    "bbox":           p["bbox"],
                     "confirmed_role": "unknown",
                     "confirmed_conf": 0.0,
                     # Sliding window history: deque of (timestamp, role, conf)
-                    "det_history": collections.deque(maxlen=60),
-                    "last_seen_ts": now,
+                    "det_history":    collections.deque(maxlen=60),
+                    "last_seen_ts":   now,
                 })
                 self._next_track_id += 1
                 ti = len(self._tracks) - 1
             else:
-                self._tracks[ti]["bbox"] = p["bbox"]
+                self._tracks[ti]["bbox"]         = p["bbox"]
                 self._tracks[ti]["last_seen_ts"] = now
             p["_track_idx"] = ti
 
@@ -714,7 +573,7 @@ class PersonRoleTracker:
 
         # 3. Update sliding window + confirm role
         for pi, p in enumerate(persons):
-            ti = p["_track_idx"]
+            ti    = p["_track_idx"]
             track = self._tracks[ti]
 
             # Append new detection hit if matched this frame
@@ -733,22 +592,22 @@ class PersonRoleTracker:
             )
 
             # Count hits per role inside the window
-            role_counts: dict = {}
+            role_counts:    dict = {}
             role_conf_sums: dict = {}
             for _t, r, c in track["det_history"]:
-                role_counts[r] = role_counts.get(r, 0) + 1
+                role_counts[r]    = role_counts.get(r, 0) + 1
                 role_conf_sums[r] = role_conf_sums.get(r, 0.0) + c
 
             # Best role = most hits, must reach confirm_count threshold
-            best_role = None
+            best_role  = None
             best_count = 0
             for r, cnt in role_counts.items():
                 if cnt >= self.confirm_count and cnt > best_count:
                     best_count = cnt
-                    best_role = r
+                    best_role  = r
 
             if best_role is not None:
-                cur = track["confirmed_role"]
+                cur       = track["confirmed_role"]
                 cur_count = role_counts.get(cur, 0)
                 # Confirm/switch only if:
                 #   - currently unknown  (first confirmation), OR
@@ -760,7 +619,7 @@ class PersonRoleTracker:
                     track["confirmed_role"] = best_role
                     track["confirmed_conf"] = role_conf_sums[best_role] / best_count
 
-            p["role"] = track["confirmed_role"]
+            p["role"]      = track["confirmed_role"]
             p["role_conf"] = track["confirmed_conf"]
             del p["_track_idx"]
 
@@ -786,42 +645,31 @@ class PersonRoleTracker:
 # Non-zone items: unchanged — expire after ghost_ttl seconds.
 # ─────────────────────────────────────────────────────────────
 class StableItemTracker:
-    """
-    Maintain stable item identities, including pinned zone ghosts.
+    """Giữ item ổn định theo vị trí và hỗ trợ ghost/pinned item.
 
-    Items seen inside goods zones become pinned so their bbox and ID can stay
-    visible through short occlusions until theft is explicitly confirmed or the
-    zone is manually refreshed.
+    Zone item được đánh dấu `pinned=True` và sẽ không tự hết hạn theo ghost_ttl.
+    Điều này cực kỳ quan trọng để tránh false loss khi item trong zone bị người che khuất.
     """
-
     def __init__(self, pos_thresh: float = 45.0, ghost_ttl: float = 3.0):
-        """
-        Initialize the stable item tracker and registry thresholds.
-        """
         self.pos_thresh = float(pos_thresh)
-        self.ghost_ttl = float(ghost_ttl)
+        self.ghost_ttl  = float(ghost_ttl)
         self._reg: dict = {}
-        self._next_sid = 1
+        self._next_sid  = 1
 
     def _make_rec(self, it: dict, now: float) -> dict:
-        """
-        Create the internal registry record for a newly seen item.
-        """
         return {
-            "center": it["center"],
-            "bbox": list(it["bbox"]),
-            "name": it.get("name", "item"),
-            "conf": float(it.get("conf", 0.5)),
+            "center":    it["center"],
+            "bbox":      list(it["bbox"]),
+            "name":      it.get("name", "item"),
+            "conf":      float(it.get("conf", 0.5)),
             "last_seen": now,
-            "ghost": False,
-            "pinned": False,  # True = zone item, never auto-expires
+            "ghost":     False,
+            "pinned":    False,   # True = zone item, never auto-expires
         }
 
     def _best_pos_match(self, cx: float, cy: float, used: set):
-        """
-        Find the closest unmatched registry entry within the position threshold.
-        """
-        best_sid = None
+        """Tìm stable item gần nhất để match với detection mới."""
+        best_sid  = None
         best_dist = float("inf")
         for sid, rec in self._reg.items():
             if sid in used:
@@ -830,24 +678,22 @@ class StableItemTracker:
             d = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5
             if d < self.pos_thresh and d < best_dist:
                 best_dist = d
-                best_sid = sid
+                best_sid  = sid
         return best_sid
 
     def update(self, detected: list, now: float,
                goods_zones_px: list = None):
         """
-        Merge raw item detections into stable and ghost item views.
+        detected       : raw items from det_model this frame
+        now            : time.time()
+        goods_zones_px : pixel-space goods zones; items inside these zones
+                         get pinned (infinite ghost TTL)
 
-        Args:
-            detected: Raw item detections from the current frame.
-            now: Current timestamp.
-            goods_zones_px: Pixel-space goods zones used to pin in-zone items.
-
-        Returns:
-            tuple[list, list]: A combined stable list (real + ghosts) and the
-            real detected items only.
+        Returns (stable_items, real_items):
+          stable_items : real + ghost/pinned  (zone count + display)
+          real_items   : only detected         (theft check + concealment)
         """
-        used_sids = set()
+        used_sids  = set()
         real_items = []
 
         # ── Phase 1: match detections to registry ─────────────────────
@@ -862,11 +708,11 @@ class StableItemTracker:
 
             if sid is not None:
                 rec = self._reg[sid]
-                rec["center"] = (cx, cy)
-                rec["bbox"] = list(it["bbox"])
-                rec["conf"] = float(it.get("conf", rec["conf"]))
+                rec["center"]    = (cx, cy)
+                rec["bbox"]      = list(it["bbox"])
+                rec["conf"]      = float(it.get("conf", rec["conf"]))
                 rec["last_seen"] = now
-                rec["ghost"] = False
+                rec["ghost"]     = False
             else:
                 sid = self._next_sid
                 self._next_sid += 1
@@ -882,10 +728,10 @@ class StableItemTracker:
                             break
 
             used_sids.add(sid)
-            new_it = dict(it)
+            new_it             = dict(it)
             new_it["track_id"] = sid
-            new_it["ghost"] = False
-            new_it["pinned"] = self._reg[sid]["pinned"]
+            new_it["ghost"]    = False
+            new_it["pinned"]   = self._reg[sid]["pinned"]
             real_items.append(new_it)
 
         # ── Phase 2: ghost or expire unmatched entries ─────────────────
@@ -900,37 +746,34 @@ class StableItemTracker:
                 # Pinned zone item: NEVER expires → always ghost-drawn
                 rec["ghost"] = True
                 ghost_items.append({
-                    "bbox": rec["bbox"],
-                    "center": rec["center"],
-                    "conf": rec["conf"],
-                    "name": rec["name"],
+                    "bbox":     rec["bbox"],
+                    "center":   rec["center"],
+                    "conf":     rec["conf"],
+                    "name":     rec["name"],
                     "track_id": sid,
-                    "ghost": True,
-                    "pinned": True,
+                    "ghost":    True,
+                    "pinned":   True,
                 })
             elif age > self.ghost_ttl:
                 del self._reg[sid]
             else:
                 rec["ghost"] = True
                 ghost_items.append({
-                    "bbox": rec["bbox"],
-                    "center": rec["center"],
-                    "conf": rec["conf"],
-                    "name": rec["name"],
+                    "bbox":     rec["bbox"],
+                    "center":   rec["center"],
+                    "conf":     rec["conf"],
+                    "name":     rec["name"],
                     "track_id": sid,
-                    "ghost": True,
-                    "pinned": False,
+                    "ghost":    True,
+                    "pinned":   False,
                 })
 
         return real_items + ghost_items, real_items
 
     def remove_zone_ghosts(self, zone_pts: list):
-        """
-        Delete ghosted items whose centers still fall inside a zone.
-
-        This method is typically called after confirmed theft or after a staff-led
-        zone refresh so stale pinned overlays disappear immediately.
-        """
+        """Xóa toàn bộ ghost item trong zone sau khi đã xác nhận mất hàng."""
+        """Remove ALL ghost items (including pinned) from this zone.
+        Called after GoodsZoneGuard confirms theft."""
         for sid in list(self._reg.keys()):
             rec = self._reg[sid]
             if rec["ghost"] and point_in_poly(rec["center"], zone_pts):
@@ -941,64 +784,56 @@ class StableItemTracker:
 # Goods Zone Guard  (unchanged logic)
 # ─────────────────────────────────────────────────────────────
 class GoodsZoneGuard:
-    """
-    Finite-state machine that decides whether goods were taken from a zone.
+    """State machine xác nhận mất hàng cho từng goods zone.
 
-    The guard freezes zone counts during interaction, waits for the zone to
-    clear, compares the post-interaction count against the pre-interaction
-    baseline, and emits events for media staging or alert commitment.
+    Trạng thái chính:
+    - IDLE: vùng bình thường, đang học baseline.
+    - GUEST_INTERACT: guest đang chạm/tương tác vùng.
+    - COOLDOWN: guest vừa rời vùng, chờ xác minh thiếu hàng.
+    - ALERT: đã xác nhận mất item.
     """
-    IDLE = 0
+    IDLE           = 0
     GUEST_INTERACT = 1
-    COOLDOWN = 2
-    ALERT = 3
+    COOLDOWN       = 2
+    ALERT          = 3
 
-    COOLDOWN_SEC = 1.5
+    COOLDOWN_SEC  = 1.5
     ALERT_DISPLAY = 10.0
 
     def __init__(self, name):
-        """
-        Initialize per-zone state, counters, timers, and emitted events.
-        """
-        self.name = name
+        self.name  = name
         self.state = self.IDLE
         self.baseline_count = 0
-        self.clear_counts = collections.deque(maxlen=8)
-        self.exit_ts = 0.0
-        self.alert_ts = 0.0
+        self.clear_counts   = collections.deque(maxlen=8)
+        self.exit_ts   = 0.0
+        self.alert_ts  = 0.0
         self.alert_msg = ""
-        self.missing = 0
-        self.had_guest_contact = False
+        self.missing   = 0
+        self.had_guest_contact           = False
         self.staff_touched_during_window = False
         # Staff item-change tracking
-        self._staff_in_zone: bool = False
+        self._staff_in_zone: bool     = False
         self.staff_reset_needed: bool = False
         # After a guest/guest-like person leaves the zone, only start the
         # disappearance timer when the zone is actually clear of blockers
         # (staff, or unknown when unknown_as_guest=False). This prevents
         # false alerts caused by someone else still occluding the item.
-        self._cooldown_max_raw: int = 0
+        self._cooldown_max_raw: int       = 0
         self._cooldown_clear_since: float = 0.0
-        self._events: list = []
+        self._events: list                = []
 
     def _emit(self, event_name: str):
-        """
-        Queue an internal event for the outer control loop to consume.
-        """
+        """Đẩy event nội bộ ra queue để main loop xử lý side-effect."""
         self._events.append(event_name)
 
     def pop_events(self):
-        """
-        Return and clear queued zone events.
-        """
+        """Lấy và xóa queue event hiện tại."""
         out = list(self._events)
         self._events.clear()
         return out
 
     def _update_clear_baseline(self, count: int):
-        """
-        Refresh the baseline item count using median smoothing.
-        """
+        """Cập nhật baseline item count bằng median của cửa sổ clear."""
         self.clear_counts.append(int(count))
         self.baseline_count = (
             int(round(float(np.median(self.clear_counts))))
@@ -1006,18 +841,14 @@ class GoodsZoneGuard:
         )
 
     def _reset_window(self):
-        """
-        Reset transient interaction flags for the active verification window.
-        """
-        self.had_guest_contact = False
+        """Reset các biến tạm của một phiên tương tác."""
+        self.had_guest_contact           = False
         self.staff_touched_during_window = False
-        self._cooldown_max_raw = 0
-        self._cooldown_clear_since = 0.0
+        self._cooldown_max_raw           = 0
+        self._cooldown_clear_since       = 0.0
 
     def _go_idle(self, count: int, discard_snapshot: bool = True):
-        """
-        Return the guard to IDLE and optionally discard staged media.
-        """
+        """Đưa guard về IDLE và tái học baseline từ count hiện tại."""
         self.state = self.IDLE
         self.clear_counts.clear()
         self._update_clear_baseline(count)
@@ -1026,9 +857,10 @@ class GoodsZoneGuard:
             self._emit("discard_snapshot")
 
     def force_rebaseline(self, raw_item_count: int):
-        """
-        Rebuild the baseline after staff has entered and left the zone.
-        """
+        """Tái baseline sau khi staff đã vào rồi rời zone."""
+        """Called by main loop after staff leaves zone.
+        Clears ALL pinned ghosts (already done externally) and re-builds
+        the baseline from the actual detected item count."""
         self.clear_counts.clear()
         self._update_clear_baseline(raw_item_count)
         self.staff_reset_needed = False
@@ -1041,17 +873,6 @@ class GoodsZoneGuard:
                now: float, staff_interacting: bool = False,
                raw_item_count: int = None,
                cooldown_blocked: bool = False):
-        """
-        Advance the zone state machine for the current frame.
-
-        Args:
-            guest_interacting: Whether a guest is currently interacting with the zone.
-            stable_item_count: Item count including pinned ghosts for display logic.
-            now: Current timestamp.
-            staff_interacting: Whether staff is currently interacting with the zone.
-            raw_item_count: Real item count without synthetic ghosts.
-            cooldown_blocked: Whether another person is still occluding the zone.
-        """
         stable_item_count = int(stable_item_count)
         check_count = int(raw_item_count) if raw_item_count is not None else stable_item_count
 
@@ -1103,14 +924,14 @@ class GoodsZoneGuard:
                     best_count = self._cooldown_max_raw
                     diff = self.baseline_count - best_count
                     if self.had_guest_contact and diff > 0:
-                        self.missing = diff
+                        self.missing   = diff
                         self.alert_msg = (
                             f"GOODS TAKEN [{self.name}]  "
                             f"guest left zone -> "
                             f"{self.baseline_count} -> {best_count} items"
                         )
                         self.alert_ts = now
-                        self.state = self.ALERT
+                        self.state    = self.ALERT
                         self._emit("commit_snapshot")
                         print(f"[ZONE {self.name}] {self.alert_msg}")
                     else:
@@ -1129,63 +950,41 @@ class GoodsZoneGuard:
                 self._go_idle(stable_item_count)
 
     @property
-    def is_alerting(self):
-        """
-        bool: True when the guard is in ALERT state.
-        """
-        return self.state == self.ALERT
-
+    def is_alerting(self):     return self.state == self.ALERT
     @property
-    def person_blocking(self):
-        """
-        bool: True while interaction/cooldown should freeze zone display.
-        """
-        return self.state in (self.GUEST_INTERACT, self.COOLDOWN)
+    def person_blocking(self): return self.state in (self.GUEST_INTERACT, self.COOLDOWN)
 
 
 # ─────────────────────────────────────────────────────────────
 # Concealment Tracker  (ZONE-ONLY, GUEST-ONLY — unchanged logic)
 # ─────────────────────────────────────────────────────────────
 class ConcealmentTracker:
-    """
-    Track zone-origin items that may be concealed and carried away.
+    """Theo dõi item bị tiếp cận, mang đi rồi biến mất khỏi goods zone.
 
-    This tracker focuses on items that begin in goods zones, verifies guest-only
-    grab behavior through wrist proximity plus movement, and raises concealment
-    alerts when an item disappears shortly after that interaction.
+    Khác với GoodsZoneGuard vốn nhìn theo item count toàn zone,
+    tracker này bám theo từng item và tương quan với cổ tay người.
     """
     ALERT_DISPLAY = 10.0
 
     def __init__(self, carry_dist=90, carry_frames=3, move_thresh=18,
                  unknown_as_guest=True):
-        """
-        Initialize concealment thresholds and per-item carry state.
-        """
-        self.carry_dist = carry_dist
-        self.carry_frames = carry_frames
-        self.move_thresh = move_thresh
+        self.carry_dist       = carry_dist
+        self.carry_frames     = carry_frames
+        self.move_thresh      = move_thresh
         self.unknown_as_guest = unknown_as_guest
-        self._items: dict = {}
-        self.alerts: list = []
+        self._items: dict     = {}
+        self.alerts: list     = []
 
     def _is_guest(self, role: str) -> bool:
-        """
-        Return True when a role should be treated as a guest actor.
-        """
         if role == "guest": return True
         if role == "unknown" and self.unknown_as_guest: return True
         return False
 
     def _is_staff(self, role: str) -> bool:
-        """
-        Return True when a role is confirmed as staff.
-        """
         return role == "staff"
 
     def _get_zone_pts(self, zone_name: str, goods_zones_px: list):
-        """
-        Look up polygon points for a zone name.
-        """
+        """Lấy polygon zone theo tên."""
         for z in goods_zones_px:
             if z["name"] == zone_name:
                 return z["pts"]
@@ -1193,16 +992,6 @@ class ConcealmentTracker:
 
     def update(self, items: list, people: list,
                goods_zones_px: list, now: float, frame=None):
-        """
-        Update carry state and concealment alerts for tracked items.
-
-        Args:
-            items: Real item detections for the frame.
-            people: Pose detections with stabilized role labels.
-            goods_zones_px: Pixel-space goods zones.
-            now: Current timestamp.
-            frame: Optional frame used to store a carry-time snapshot.
-        """
         current_ids = {it["track_id"] for it in items
                        if it.get("track_id") is not None}
 
@@ -1214,7 +1003,7 @@ class ConcealmentTracker:
             if item_zone_name is None and tid not in self._items:
                 continue
 
-            near_wrist = False
+            near_wrist   = False
             carrier_role = "unknown"
             item_zone_pts = None
             if item_zone_name is not None:
@@ -1230,40 +1019,40 @@ class ConcealmentTracker:
                     if item_zone_pts is not None and not point_in_poly((wx, wy), item_zone_pts):
                         continue
                     if dist2((cx, cy), (wx, wy)) < self.carry_dist ** 2:
-                        near_wrist = True
+                        near_wrist   = True
                         carrier_role = p.get("role", "unknown")
                         break
                 if near_wrist: break
 
             if tid not in self._items:
                 self._items[tid] = {
-                    "name": it.get("name", "item"),
-                    "near_frames": 0,
-                    "being_carried": False,
+                    "name":               it.get("name", "item"),
+                    "near_frames":        0,
+                    "being_carried":      False,
                     "approach_confirmed": False,
-                    "carrier_role": "unknown",
-                    "last_seen_ts": now,
-                    "anchor_pos": (cx, cy),
-                    "has_moved": False,
-                    "zone_name": item_zone_name,
-                    "carry_snapshot": None,
+                    "carrier_role":       "unknown",
+                    "last_seen_ts":       now,
+                    "anchor_pos":         (cx, cy),
+                    "has_moved":          False,
+                    "zone_name":          item_zone_name,
+                    "carry_snapshot":     None,
                 }
             rec = self._items[tid]
             rec["last_seen_ts"] = now
-            rec["name"] = it.get("name", rec["name"])
+            rec["name"]         = it.get("name", rec["name"])
             if item_zone_name is not None:
                 rec["zone_name"] = item_zone_name
 
             if near_wrist and self._is_staff(carrier_role):
-                rec["near_frames"] = 0
-                rec["being_carried"] = False
+                rec["near_frames"]        = 0
+                rec["being_carried"]      = False
                 rec["approach_confirmed"] = False
-                rec["has_moved"] = False
-                rec["carry_snapshot"] = None
+                rec["has_moved"]          = False
+                rec["carry_snapshot"]     = None
             elif near_wrist and self._is_guest(carrier_role):
                 if rec["near_frames"] == 0:
-                    rec["anchor_pos"] = (cx, cy)
-                    rec["has_moved"] = False
+                    rec["anchor_pos"]         = (cx, cy)
+                    rec["has_moved"]          = False
                     rec["approach_confirmed"] = False
                     if rec.get("carry_snapshot") is None and frame is not None:
                         rec["carry_snapshot"] = frame.copy()
@@ -1279,8 +1068,8 @@ class ConcealmentTracker:
             else:
                 rec["near_frames"] = max(0, rec["near_frames"] - 1)
                 if rec["near_frames"] == 0:
-                    rec["being_carried"] = False
-                    rec["has_moved"] = False
+                    rec["being_carried"]      = False
+                    rec["has_moved"]          = False
                     rec["approach_confirmed"] = False
 
         for tid in list(self._items):
@@ -1305,22 +1094,19 @@ class ConcealmentTracker:
                             "msg": (f"CONCEALMENT [{zone_name}]: "
                                     f"[{rec['name']}] id={tid} "
                                     f"concealed by {rec['carrier_role'].upper()}"),
-                            "ts": now,
+                            "ts":        now,
                             "zone_name": zone_name,
-                            "snapshot": rec.get("carry_snapshot"),
+                            "snapshot":  rec.get("carry_snapshot"),
                         })
                         print(f"[CONCEAL] {self.alerts[-1]['msg']}")
                         rec["approach_confirmed"] = False
-                        rec["being_carried"] = False
+                        rec["being_carried"]      = False
                 if age > 4.0:
                     del self._items[tid]
 
         self.alerts = [a for a in self.alerts if (now - a["ts"]) < self.ALERT_DISPLAY]
 
     def being_carried_ids(self) -> set:
-        """
-        Return track IDs currently considered to be carried.
-        """
         return {tid for tid, r in self._items.items() if r["being_carried"]}
 
 
@@ -1328,9 +1114,7 @@ class ConcealmentTracker:
 # Alert overlay renderer
 # ─────────────────────────────────────────────────────────────
 def draw_alerts(vis, zone_guards_list, conceal, now):
-    """
-    Render active zone and concealment alerts on the output frame.
-    """
+    """Render vùng alert overlay ở đáy màn hình."""
     H, W = vis.shape[:2]
     msgs = []
     for zg in zone_guards_list:
@@ -1339,15 +1123,15 @@ def draw_alerts(vis, zone_guards_list, conceal, now):
     for a in conceal.alerts:
         msgs.append(("conceal", a["msg"], now - a["ts"], conceal.ALERT_DISPLAY))
     if not msgs: return
-    fh = max(0.38, min(0.52, H / 800))
-    lh = int(fh * 42) + 6
+    fh    = max(0.38, min(0.52, H / 800))
+    lh    = int(fh * 42) + 6
     total = len(msgs) * lh + 12
-    sy = H - total - 8
+    sy    = H - total - 8
     cv2.rectangle(vis, (0, sy - 8), (W, H), (0, 0, 0), -1)
     for i, (kind, msg, age, maxage) in enumerate(msgs):
-        y = sy + i * lh + lh
+        y        = sy + i * lh + lh
         blink_on = age < 3.0 and int(age * 4) % 2 == 0
-        color = (0, 0, 255) if kind == "zone" else (0, 60, 255)
+        color    = (0, 0, 255) if kind == "zone" else (0, 60, 255)
         if not blink_on: color = tuple(int(c * 0.65) for c in color)
         bar_w = int((W - 20) * max(0.0, 1.0 - age / maxage))
         cv2.rectangle(vis, (10, y + 2), (10 + bar_w, y + 5), color, -1)
@@ -1360,18 +1144,14 @@ def draw_alerts(vis, zone_guards_list, conceal, now):
 # Dashed rectangle for pinned-ghost zone items
 # ─────────────────────────────────────────────────────────────
 def draw_dashed_rect(img, pt1, pt2, color, thickness=1, dash_len=8):
-    """
-    Draw a dashed rectangle used for pinned ghost overlays.
-    """
-    x1, y1 = pt1;
-    x2, y2 = pt2
+    """Vẽ bbox nét đứt cho ghost item pinned."""
+    x1, y1 = pt1; x2, y2 = pt2
     edges = [(x1, y1, x2, y1), (x2, y1, x2, y2),
              (x2, y2, x1, y2), (x1, y2, x1, y1)]
     for ax, ay, bx, by in edges:
-        dx = bx - ax;
-        dy = by - ay
-        length = max(1, int((dx ** 2 + dy ** 2) ** 0.5))
-        steps = max(1, length // (dash_len * 2))
+        dx = bx - ax; dy = by - ay
+        length = max(1, int((dx**2 + dy**2) ** 0.5))
+        steps  = max(1, length // (dash_len * 2))
         for i in range(steps):
             t0 = i * 2 * dash_len / length
             t1 = min(1.0, (i * 2 + 1) * dash_len / length)
@@ -1384,162 +1164,112 @@ def draw_dashed_rect(img, pt1, pt2, color, thickness=1, dash_len=8):
 # FFmpeg reader
 # ─────────────────────────────────────────────────────────────
 def build_ffmpeg_cmd(src, out_w, out_h, out_fps, ffmpeg_path, timeout_us, disabled_opts):
-    """
-    Build the FFmpeg command used to decode the input stream.
-
-    The command adapts to RTSP sources, optional scaling/FPS reduction, and a
-    set of auto-disabled options when FFmpeg reports unsupported flags.
-    """
+    """Tạo command FFmpeg đọc raw BGR frame từ input stream/video."""
     vf_parts = []
     if out_w > 0 and out_h > 0: vf_parts.append(f"scale={out_w}:{out_h}")
     if out_fps > 0:              vf_parts.append(f"fps={out_fps}")
     cmd = [ffmpeg_path, "-hide_banner", "-loglevel", "warning"]
     if is_rtsp(src):
         cmd += ["-rtsp_transport", "tcp"]
-        if "timeout" not in disabled_opts: cmd += ["-timeout", str(int(timeout_us))]
-        if "fflags" not in disabled_opts: cmd += ["-fflags", "+nobuffer+discardcorrupt"]
+        if "timeout"    not in disabled_opts: cmd += ["-timeout",    str(int(timeout_us))]
+        if "fflags"     not in disabled_opts: cmd += ["-fflags",     "+nobuffer+discardcorrupt"]
         if "err_detect" not in disabled_opts: cmd += ["-err_detect", "ignore_err"]
-        if "max_delay" not in disabled_opts: cmd += ["-max_delay", "500000"]
+        if "max_delay"  not in disabled_opts: cmd += ["-max_delay",  "500000"]
     cmd += ["-i", src, "-an", "-sn", "-dn"]
     if vf_parts: cmd += ["-vf", ",".join(vf_parts)]
     cmd += ["-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
     return cmd
 
-
 _UNREC_RE = re.compile(r"Unrecognized option '([^']+)'\.", re.IGNORECASE)
 
-
 class FFmpegLatestFrameReader:
-    """
-    Continuously decode a source and expose only the latest frame.
+    """Reader bất đồng bộ luôn giữ frame mới nhất từ FFmpeg.
 
-    The reader runs FFmpeg in a background process, auto-restarts on failure,
-    and drops older frames so the main loop always works on the freshest frame
-    available.
+    Thiết kế này giảm độ trễ hiển thị vì pipeline detection không cần xử lý hết
+    mọi frame đi qua, chỉ cần frame mới nhất tại thời điểm suy luận.
     """
-
     def __init__(self, src, width, height, out_fps, timeout_us, ffmpeg_path="ffmpeg"):
-        """
-        Store reader configuration and initialize runtime state.
-        """
-        self.src = src;
-        self.w = int(width);
-        self.h = int(height)
-        self.out_fps = float(out_fps);
-        self.timeout_us = int(timeout_us)
-        self.ffmpeg_path = ffmpeg_path;
-        self.frame_size = self.w * self.h * 3
-        self.proc = None;
-        self.running = False;
-        self.thread = None
-        self.lock = threading.Lock();
-        self.latest = None
-        self.latest_ts = 0.0;
-        self.frame_id = 0
-        self.last_err = "";
-        self.last_restart_ts = 0.0
-        self.disabled_opts = set();
-        self.disable_count = 0
+        self.src = src; self.w = int(width); self.h = int(height)
+        self.out_fps = float(out_fps); self.timeout_us = int(timeout_us)
+        self.ffmpeg_path = ffmpeg_path; self.frame_size = self.w * self.h * 3
+        self.proc = None; self.running = False; self.thread = None
+        self.lock = threading.Lock(); self.latest = None
+        self.latest_ts = 0.0; self.frame_id = 0
+        self.last_err = ""; self.last_restart_ts = 0.0
+        self.disabled_opts = set(); self.disable_count = 0
         self._restart_requested = False
 
     def start(self):
-        """
-        Start the background FFmpeg reader thread.
-        """
+        """Khởi chạy thread nền đọc frame."""
         self.running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread  = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def stop(self):
-        """
-        Stop the reader loop and terminate the FFmpeg process.
-        """
-        self.running = False
-        self._kill_proc()
+        """Dừng reader và kill tiến trình FFmpeg hiện tại."""
+        self.running = False; self._kill_proc()
 
     def get_latest(self):
-        """
-        Return a copy of the latest decoded frame, timestamp, and frame id.
-        """
+        """Lấy bản copy của frame mới nhất cùng timestamp và frame_id."""
         with self.lock:
             if self.latest is None: return None, 0.0, 0
             return self.latest.copy(), self.latest_ts, self.frame_id
 
     def _kill_proc(self):
-        """
-        Terminate the current FFmpeg process and close its pipes safely.
-        """
+        """Dừng tiến trình FFmpeg hiện tại và đóng pipe."""
         p, self.proc = self.proc, None
         if p is None: return
-        try:
-            p.kill()
-        except:
-            pass
+        try: p.kill()
+        except: pass
         for attr in ("stdout", "stderr"):
             try:
                 s = getattr(p, attr)
                 if s: s.close()
-            except:
-                pass
+            except: pass
 
     def _map_opt(self, opt):
-        """
-        Normalize unsupported FFmpeg option names to internal keys.
-        """
+        """Chuẩn hóa tên option FFmpeg không hỗ trợ về key nội bộ."""
         opt = opt.strip().lstrip("-")
         return {"timeout": "timeout", "stimeout": "timeout", "fflags": "fflags",
                 "err_detect": "err_detect", "max_delay": "max_delay"}.get(opt, opt)
 
     def _stderr_loop(self, proc):
-        """
-        Monitor FFmpeg stderr and trigger option fallback on errors.
-        """
+        """Đọc stderr để log lỗi và auto-disable unsupported option."""
         try:
             while self.running and proc and proc.stderr:
                 line = proc.stderr.readline()
                 if not line: break
                 s = line.decode(errors="ignore").strip()
                 if not s: continue
-                self.last_err = s;
-                print("[FFMPEG]", s)
+                self.last_err = s; print("[FFMPEG]", s)
                 m = _UNREC_RE.search(s)
                 if m:
                     key = self._map_opt(m.group(1))
                     if key not in self.disabled_opts:
                         print(f"[FFMPEG] Auto-disabling: {key}")
-                        self.disabled_opts.add(key);
-                        self.disable_count += 1
+                        self.disabled_opts.add(key); self.disable_count += 1
                         self._restart_requested = True
-        except:
-            pass
+        except: pass
 
     def _start_proc(self):
-        """
-        Launch FFmpeg with the currently allowed option set.
-        """
+        """Tạo mới tiến trình FFmpeg với option hiện tại."""
         cmd = build_ffmpeg_cmd(self.src, self.w, self.h, self.out_fps,
                                self.ffmpeg_path, self.timeout_us, self.disabled_opts)
         cf = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         print("\n[FFMPEG CMD]\n" + " ".join(cmd) + "\n")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 bufsize=10 ** 8, creationflags=cf)
-        self.proc = proc;
-        self.last_restart_ts = time.time()
+        self.proc = proc; self.last_restart_ts = time.time()
         self._restart_requested = False
         threading.Thread(target=self._stderr_loop, args=(proc,), daemon=True).start()
 
     def _restart_proc(self):
-        """
-        Restart FFmpeg with a short backoff to avoid rapid flapping.
-        """
+        """Restart FFmpeg có pacing tối thiểu để tránh loop quá nhanh."""
         if time.time() - self.last_restart_ts < 0.4: time.sleep(0.4)
-        self._kill_proc();
-        self._start_proc()
+        self._kill_proc(); self._start_proc()
 
     def _read_exact(self, n):
-        """
-        Read an exact number of bytes from FFmpeg stdout.
-        """
+        """Đọc đủ số byte của một frame rawvideo; thiếu byte xem như lỗi."""
         buf = b""
         while len(buf) < n and self.running and self.proc and self.proc.stdout:
             chunk = self.proc.stdout.read(n - len(buf))
@@ -1548,22 +1278,19 @@ class FFmpegLatestFrameReader:
         return buf if len(buf) == n else None
 
     def _loop(self):
-        """
-        Main background loop that keeps the latest decoded frame updated.
-        """
+        """Luồng đọc frame chính của reader."""
         self._start_proc()
         while self.running:
             if self.proc is None: self._restart_proc(); continue
             if self.proc.poll() is not None or self._restart_requested:
                 if self.disable_count > 8:
                     self.last_err = "Too many unsupported FFmpeg options."
-                self._restart_proc();
-                continue
+                self._restart_proc(); continue
             raw = self._read_exact(self.frame_size)
             if raw is None: self._restart_proc(); continue
             frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.h, self.w, 3))
             with self.lock:
-                self.latest = frame
+                self.latest    = frame
                 self.latest_ts = time.time()
                 self.frame_id += 1
 
@@ -1572,24 +1299,16 @@ class FFmpegLatestFrameReader:
 # TrackBuffer  (visual ghost buffer for smooth display)
 # ─────────────────────────────────────────────────────────────
 class TrackBuffer:
-    """
-    Short-lived visual ghost buffer used to smooth overlay flicker.
+    """Ghost buffer ngắn hạn chỉ phục vụ hiển thị mượt hơn.
 
-    Unlike StableItemTracker, this buffer is only for display continuity across
-    a few frames and does not participate in theft decisions.
+    Khác với StableItemTracker, class này không tham gia logic nghiệp vụ mất hàng.
+    Nó chỉ giúp bbox đỡ nhấp nháy giữa vài frame hiển thị liên tiếp.
     """
-
     def __init__(self, ghost_frames=6):
-        """
-        Initialize the temporary overlay buffer and ghost lifetime.
-        """
         self.ghost_frames = ghost_frames
-        self._buf: dict = {}
+        self._buf: dict   = {}
 
     def update(self, detected_items: list) -> list:
-        """
-        Refresh the visual buffer and return live items plus short ghosts.
-        """
         now_ids = set()
         for it in detected_items:
             tid = it.get("track_id")
@@ -1601,7 +1320,7 @@ class TrackBuffer:
                 self._buf[tid]["ttl"] -= 1
                 if self._buf[tid]["ttl"] <= 0:
                     del self._buf[tid]
-        out = list(detected_items)
+        out      = list(detected_items)
         seen_ids = {it.get("track_id") for it in detected_items}
         for tid, rec in self._buf.items():
             if tid not in seen_ids:
@@ -1609,9 +1328,11 @@ class TrackBuffer:
         return out
 
     def remove_zone_items(self, zone_pts: list):
-        """
-        Immediately clear buffered overlays whose centers fall inside a zone.
-        """
+        """Xóa ngay item buffer trong zone để overlay phản ánh trạng thái mới."""
+        """Immediately flush visual ghosts for a zone.
+        Used when staff refreshes a zone or after theft is confirmed so the
+        old pinned bbox/ID disappears right away instead of lingering for a
+        few buffer frames."""
         for tid in list(self._buf.keys()):
             item = self._buf[tid].get("item") or {}
             center = item.get("center")
@@ -1620,38 +1341,25 @@ class TrackBuffer:
 
 
 def filter_contained_boxes(items, iou_min_thresh=0.6):
-    """
-    Suppress highly overlapping item boxes that are effectively duplicates.
-    """
+    """Loại bớt bbox item lồng nhau để giảm duplicate detection."""
     if len(items) < 2: return items
-
-    def box_area(b):
-        return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-
+    def box_area(b): return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
     def intersection(b1, b2):
-        ix1 = max(b1[0], b2[0]);
-        iy1 = max(b1[1], b2[1])
-        ix2 = min(b1[2], b2[2]);
-        iy2 = min(b1[3], b2[3])
-        return max(0, ix2 - ix1) * max(0, iy2 - iy1)
-
-    n = len(items);
-    suppress = [False] * n
+        ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
+        ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
+        return max(0, ix2-ix1) * max(0, iy2-iy1)
+    n = len(items); suppress = [False]*n
     for i in range(n):
         for j in range(n):
-            if i == j or suppress[i] or suppress[j]: continue
-            b1 = items[i]["bbox"];
-            b2 = items[j]["bbox"]
-            a1 = box_area(b1);
-            a2 = box_area(b2)
-            if a1 == 0 or a2 == 0: continue
-            inter = intersection(b1, b2)
+            if i==j or suppress[i] or suppress[j]: continue
+            b1=items[i]["bbox"]; b2=items[j]["bbox"]
+            a1=box_area(b1); a2=box_area(b2)
+            if a1==0 or a2==0: continue
+            inter  = intersection(b1, b2)
             io_min = inter / min(a1, a2)
             if io_min >= iou_min_thresh:
-                if a1 > a2:
-                    suppress[i] = True
-                else:
-                    suppress[j] = True
+                if a1 > a2: suppress[i] = True
+                else:        suppress[j] = True
     return [it for k, it in enumerate(items) if not suppress[k]]
 
 
@@ -1659,63 +1367,66 @@ def filter_contained_boxes(items, iou_min_thresh=0.6):
 # Main
 # ─────────────────────────────────────────────────────────────
 def main():
-    """
-    Parse CLI arguments and run the full anti-theft monitoring pipeline.
+    """Entry point của chương trình anti-theft monitor.
 
-    This function wires together stream input, model inference, stable tracking,
-    zone guards, concealment logic, Home Assistant integration, and on-screen
-    visualization inside the real-time processing loop.
+    Nên đọc hàm này như một sơ đồ orchestrator:
+    - parse config,
+    - load model,
+    - đọc frame,
+    - chạy pose/det theo nhịp riêng,
+    - hợp nhất state,
+    - render overlay,
+    - gửi Home Assistant.
     """
     ap = argparse.ArgumentParser("Anti-theft")
-    ap.add_argument("--rtsp", default="rtsp://admin:KOEYHZ@192.168.2.72:554/cam/realmonitor?channel=1&subtype=1")
+    ap.add_argument("--rtsp",  default="rtsp://admin:KOEYHZ@192.168.2.72:554/cam/realmonitor?channel=1&subtype=1")
     ap.add_argument("--video", default="")
     ap.add_argument("--zones", default="zones.json")
-    ap.add_argument("--det_model", required=True)
+    ap.add_argument("--det_model",  required=True)
     ap.add_argument("--pose_model", required=True)
-    ap.add_argument("--imgsz", type=int, default=640)
-    ap.add_argument("--conf_det", type=float, default=0.4,
+    ap.add_argument("--imgsz",     type=int,   default=640)
+    ap.add_argument("--conf_det",  type=float, default=0.4,
                     help="Confidence threshold for det_model items (default 0.4)")
     ap.add_argument("--conf_role", type=float, default=0.6,
                     help="Separate confidence threshold for staff/guest detections "
                          "(default 0.7). Higher than conf_det to reduce staff↔guest confusion.")
     ap.add_argument("--conf_pose", type=float, default=0.4)
-    ap.add_argument("--ffmpeg_path", default="ffmpeg")
+    ap.add_argument("--ffmpeg_path",  default="ffmpeg")
     ap.add_argument("--ffprobe_path", default="ffprobe")
-    ap.add_argument("--out_width", type=int, default=0)
-    ap.add_argument("--out_height", type=int, default=0)
+    ap.add_argument("--out_width",  type=int,   default=0)
+    ap.add_argument("--out_height", type=int,   default=0)
     ap.add_argument("--ffmpeg_fps", type=float, default=12.0)
-    ap.add_argument("--timeout_us", type=int, default=10_000_000)
-    ap.add_argument("--pose_fps", type=float, default=4.0)
-    ap.add_argument("--det_fps", type=float, default=6.0)
-    ap.add_argument("--carry_dist", type=int, default=40)
-    ap.add_argument("--carry_frames", type=int, default=3)
-    ap.add_argument("--move_thresh", type=int, default=18)
+    ap.add_argument("--timeout_us", type=int,   default=10_000_000)
+    ap.add_argument("--pose_fps",   type=float, default=4.0)
+    ap.add_argument("--det_fps",    type=float, default=6.0)
+    ap.add_argument("--carry_dist",   type=int,   default=40)
+    ap.add_argument("--carry_frames", type=int,   default=3)
+    ap.add_argument("--move_thresh",  type=int,   default=18)
     ap.add_argument("--cooldown_sec", type=float, default=1.5)
     ap.add_argument("--goods_zone_names", default="zone1,zone2")
     ap.add_argument("--guest_reach_dist", type=int, default=55)
     ap.add_argument("--unknown_as_guest", action="store_true", default=False)
     ap.add_argument("--no_unknown_as_guest", dest="unknown_as_guest", action="store_false")
     ap.add_argument("--stable_pos_thresh", type=float, default=45.0)
-    ap.add_argument("--stable_ghost_ttl", type=float, default=3.0,
+    ap.add_argument("--stable_ghost_ttl",  type=float, default=3.0,
                     help="Ghost TTL for non-zone items only. Zone items are pinned forever.")
     # NEW role-tracker params
-    ap.add_argument("--role_confirm_count", type=int, default=2,
+    ap.add_argument("--role_confirm_count", type=int,   default=2,
                     help="Hits needed within --role_window_s to confirm a role (default 2)")
-    ap.add_argument("--role_window_s", type=float, default=8.0,
+    ap.add_argument("--role_window_s",      type=float, default=8.0,
                     help="Sliding window in seconds for role confirmation (default 8)")
-    ap.add_argument("--role_iou_thresh", type=float, default=0.25)
+    ap.add_argument("--role_iou_thresh",    type=float, default=0.25)
     # Legacy compat — kept so old scripts don't break
     ap.add_argument("--role_confirm_frames", type=int, default=2)
-    ap.add_argument("--ha_url", default="http://192.168.2.245:8123/")
-    ap.add_argument("--ha_token",
-                    default="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI4Y2ZlYzc0MWFjMGM0OWFiYmFjOWU4YzM0ZTZiMDZkMyIsImlhdCI6MTc3MzIyMjQyNiwiZXhwIjoyMDg4NTgyNDI2fQ.G0mSeB_myjqozMUN8hXbVxNH6xr8eTzi1SWz-Qj_HRI")
-    ap.add_argument("--ha_webhook_id", default="antitheft_alert")
+    ap.add_argument("--ha_url",       default="http://192.168.2.245:8123/")
+    ap.add_argument("--ha_token",     default="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI4Y2ZlYzc0MWFjMGM0OWFiYmFjOWU4YzM0ZTZiMDZkMyIsImlhdCI6MTc3MzIyMjQyNiwiZXhwIjoyMDg4NTgyNDI2fQ.G0mSeB_myjqozMUN8hXbVxNH6xr8eTzi1SWz-Qj_HRI")
+    ap.add_argument("--ha_webhook_id",   default="antitheft_alert")
     ap.add_argument("--ha_snapshot_dir", default="www/snapshots")
-    ap.add_argument("--ha_clip_sec", type=float, default=0.0)
-    ap.add_argument("--ha_cooldown", type=float, default=15.0)
-    ap.add_argument("--show_breakdown", action="store_true")
-    ap.add_argument("--draw_items", action="store_true")
-    ap.add_argument("--draw_fps", action="store_true")
+    ap.add_argument("--ha_clip_sec",  type=float, default=0.0)
+    ap.add_argument("--ha_cooldown",  type=float, default=15.0)
+    ap.add_argument("--show_breakdown",  action="store_true")
+    ap.add_argument("--draw_items",      action="store_true")
+    ap.add_argument("--draw_fps",        action="store_true")
     ap.add_argument("--draw_carry_ring", action="store_true")
     args = ap.parse_args()
 
@@ -1727,9 +1438,9 @@ def main():
         w, h = args.out_width, args.out_height
     else:
         pw, ph = probe_size_with_ffprobe(src, args.ffprobe_path)
-        w, h = (pw, ph) if (pw and ph) else (640, 360)
+        w, h   = (pw, ph) if (pw and ph) else (640, 360)
 
-    det_model = YOLO(args.det_model)
+    det_model  = YOLO(args.det_model)
     pose_model = YOLO(args.pose_model)
 
     goods_zone_names = {norm_name(x)
@@ -1739,7 +1450,7 @@ def main():
         zname = z["name"]
         if norm_name(zname) in goods_zone_names:
             zg = GoodsZoneGuard(zname)
-            zg.COOLDOWN_SEC = args.cooldown_sec
+            zg.COOLDOWN_SEC    = args.cooldown_sec
             zone_guards[zname] = zg
         else:
             zone_guards[zname] = None
@@ -1748,23 +1459,23 @@ def main():
                             if norm_name(z["name"]) in goods_zone_names]
 
     conceal = ConcealmentTracker(
-        carry_dist=args.carry_dist,
-        carry_frames=args.carry_frames,
-        move_thresh=args.move_thresh,
-        unknown_as_guest=args.unknown_as_guest,
+        carry_dist       = args.carry_dist,
+        carry_frames     = args.carry_frames,
+        move_thresh      = args.move_thresh,
+        unknown_as_guest = args.unknown_as_guest,
     )
 
     stable_tracker = StableItemTracker(
-        pos_thresh=args.stable_pos_thresh,
-        ghost_ttl=args.stable_ghost_ttl,
+        pos_thresh = args.stable_pos_thresh,
+        ghost_ttl  = args.stable_ghost_ttl,
     )
 
-    track_buf = TrackBuffer(ghost_frames=6)
+    track_buf    = TrackBuffer(ghost_frames=6)
 
     role_tracker = PersonRoleTracker(
-        confirm_count=args.role_confirm_count,
-        candidate_window_s=args.role_window_s,
-        iou_thresh=args.role_iou_thresh,
+        confirm_count      = args.role_confirm_count,
+        candidate_window_s = args.role_window_s,
+        iou_thresh         = args.role_iou_thresh,
     )
 
     print(f"[CONFIG] role confirm: {args.role_confirm_count} hits / "
@@ -1772,17 +1483,17 @@ def main():
     print(f"[CONFIG] conf_det={args.conf_det} (items)  conf_role={args.conf_role} (staff/guest)")
 
     ha = HomeAssistantNotifier(
-        ha_url=args.ha_url,
-        token=args.ha_token,
-        zone_names=goods_zone_name_list,
-        webhook_id=args.ha_webhook_id,
-        snapshot_dir=args.ha_snapshot_dir,
-        clip_duration_s=args.ha_clip_sec,
-        notify_cooldown_s=args.ha_cooldown,
+        ha_url            = args.ha_url,
+        token             = args.ha_token,
+        zone_names        = goods_zone_name_list,
+        webhook_id        = args.ha_webhook_id,
+        snapshot_dir      = args.ha_snapshot_dir,
+        clip_duration_s   = args.ha_clip_sec,
+        notify_cooldown_s = args.ha_cooldown,
     )
 
     _prev_alerting_zones: set = set()
-    _prev_conceal_count: int = 0
+    _prev_conceal_count:  int = 0
 
     reader = FFmpegLatestFrameReader(
         src=src, width=w, height=h, out_fps=args.ffmpeg_fps,
@@ -1792,19 +1503,18 @@ def main():
     win = "Anti-Theft Monitor"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
-    last_pose_people = []
-    last_det_items_raw = []
+    last_pose_people      = []
+    last_det_items_raw    = []
     last_det_items_stable = []
-    last_det_items_vis = []
-    last_role_dets = []
-    last_goods_zones_px = []
+    last_det_items_vis    = []
+    last_role_dets        = []
+    last_goods_zones_px   = []
 
     next_pose_ts = next_det_ts = 0.0
     disp_last = pose_last = det_last = time.time()
     disp_frames = pose_runs = det_runs = 0
     disp_fps = pose_fps = det_fps = 0.0
-    last_seen_fid = 0;
-    last_frame_ts = time.time()
+    last_seen_fid = 0; last_frame_ts = time.time()
 
     ROLE_CLASSES = {"staff", "guest"}
 
@@ -1822,8 +1532,7 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
                 cv2.imshow(win, blank)
                 if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")): break
-                time.sleep(0.01);
-                continue
+                time.sleep(0.01); continue
 
             clean_frame = frame
             vis = frame.copy()
@@ -1834,11 +1543,10 @@ def main():
                     cv2.putText(vis, "STREAM STALLED", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3, cv2.LINE_AA)
             else:
-                last_seen_fid = fid;
-                last_frame_ts = now
+                last_seen_fid = fid; last_frame_ts = now
 
             # ── Build pixel zones ──────────────────────────────────────────
-            zones_px = []
+            zones_px       = []
             goods_zones_px = []
             for z in zones_norm:
                 pts = [(int(clamp(p[0], 0, 1) * W), int(clamp(p[1], 0, 1) * H))
@@ -1850,6 +1558,8 @@ def main():
             last_goods_zones_px = goods_zones_px
 
             # ── YOLOPose ───────────────────────────────────────────────────
+            # Pose chạy theo nhịp riêng để giảm tải CPU/GPU.
+            # `last_pose_people` luôn giữ kết quả mới nhất cho các bước sau dùng lại.
             pose_iv = 1.0 / args.pose_fps if args.pose_fps > 0 else 0.0
             if pose_iv == 0.0 or now >= next_pose_ts:
                 next_pose_ts = now + pose_iv
@@ -1863,7 +1573,7 @@ def main():
                             people.append({
                                 "bbox": r.boxes.xyxy[i].cpu().numpy().astype(float),
                                 "kpts": r.keypoints.xy[i].cpu().numpy().astype(float),
-                                "role": "unknown",
+                                "role":      "unknown",
                                 "role_conf": 0.0,
                             })
                 if people:
@@ -1871,14 +1581,13 @@ def main():
                 last_pose_people = people
                 pose_runs += 1
                 if now - pose_last >= 1.0:
-                    pose_fps = pose_runs / (now - pose_last)
-                    pose_runs = 0;
-                    pose_last = now
+                    pose_fps  = pose_runs / (now - pose_last)
+                    pose_runs = 0; pose_last = now
 
             # ── Draw pose + role label ─────────────────────────────────────
             _fsr = max(0.30, min(0.50, H / 800))
             for p in last_pose_people:
-                role = p.get("role", "unknown")
+                role  = p.get("role",      "unknown")
                 rconf = p.get("role_conf", 0.0)
                 color = ROLE_COLORS.get(role, ROLE_COLORS["unknown"])
                 x1, y1, x2, y2 = [int(v) for v in p["bbox"]]
@@ -1888,9 +1597,8 @@ def main():
                 if role != "unknown" and rconf > 0:
                     lbl += f" {rconf:.0%}"
                 (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, _fsr, 1)
-                lx = x1;
-                ly = max(th + 4, y1 - 4)
-                cv2.rectangle(vis, (lx, ly - th - 3), (lx + tw + 6, ly + 2), (0, 0, 0), -1)
+                lx = x1; ly = max(th + 4, y1 - 4)
+                cv2.rectangle(vis, (lx, ly - th - 3), (lx + tw + 6, ly + 2), (0,0,0), -1)
                 cv2.putText(vis, lbl, (lx + 2, ly),
                             cv2.FONT_HERSHEY_SIMPLEX, _fsr, color, 1, cv2.LINE_AA)
                 for ki in (KP_L_WRIST, KP_R_WRIST):
@@ -1902,6 +1610,8 @@ def main():
                                        conceal.carry_dist, (0, 220, 180), 1, cv2.LINE_AA)
 
             # ── YOLO det_model tracking ────────────────────────────────────
+            # Detection item/role cũng chạy theo nhịp riêng.
+            # Việc tách pose_fps và det_fps giúp tối ưu tài nguyên khi realtime.
             det_iv = 1.0 / args.det_fps if args.det_fps > 0 else 0.0
             if det_iv == 0.0 or now >= next_det_ts:
                 next_det_ts = now + det_iv
@@ -1920,14 +1630,14 @@ def main():
                     if r.boxes is not None and len(r.boxes) > 0:
                         boxes = r.boxes.xyxy.cpu().numpy()
                         confs = r.boxes.conf.cpu().numpy()
-                        clss = r.boxes.cls.cpu().numpy().astype(int)
+                        clss  = r.boxes.cls.cpu().numpy().astype(int)
                         names = r.names or {}
-                        tids = (r.boxes.id.cpu().numpy().astype(int)
-                                if r.boxes.id is not None else [None] * len(boxes))
+                        tids  = (r.boxes.id.cpu().numpy().astype(int)
+                                 if r.boxes.id is not None else [None] * len(boxes))
                         for i in range(len(boxes)):
-                            name = str(names.get(int(clss[i]), clss[i]))
+                            name  = str(names.get(int(clss[i]), clss[i]))
                             lname = name.lower()
-                            bbox = boxes[i].astype(float)
+                            bbox  = boxes[i].astype(float)
                             cx, cy = xyxy_center(bbox)
                             conf_val = float(confs[i])
                             if lname in ROLE_CLASSES:
@@ -1938,16 +1648,18 @@ def main():
                                                       "conf": conf_val})
                             elif lname == "item":
                                 items_raw.append({
-                                    "bbox": bbox,
-                                    "center": (cx, cy),
-                                    "conf": conf_val,
-                                    "name": name,
+                                    "bbox":     bbox,
+                                    "center":   (cx, cy),
+                                    "conf":     conf_val,
+                                    "name":     name,
                                     "track_id": tids[i],
                                 })
 
+                # Bỏ các bbox item lồng nhau để tránh đếm trùng trong zone.
                 items_raw = filter_contained_boxes(items_raw, iou_min_thresh=0.6)
 
-                # Pass goods_zones_px so zone items get pinned immediately
+                # Zone item được pin ngay tại đây. Đây là nút chặn false alert
+                # khi item bị che khuất và model tạm không còn thấy nó.
                 last_det_items_stable, last_det_items_raw = stable_tracker.update(
                     items_raw, now,
                     goods_zones_px=goods_zones_px,
@@ -1961,32 +1673,34 @@ def main():
 
                 det_runs += 1
                 if now - det_last >= 1.0:
-                    det_fps = det_runs / (now - det_last)
-                    det_runs = 0;
-                    det_last = now
+                    det_fps  = det_runs / (now - det_last)
+                    det_runs = 0; det_last = now
 
             # ── Concealment update ─────────────────────────────────────────
+            # Nhánh concealment theo dõi item cụ thể gần cổ tay,
+            # độc lập với logic item-count của GoodsZoneGuard.
             conceal.update(
-                items=last_det_items_raw,
-                people=last_pose_people,
-                goods_zones_px=last_goods_zones_px,
-                now=now,
-                frame=vis,
+                items          = last_det_items_raw,
+                people         = last_pose_people,
+                goods_zones_px = last_goods_zones_px,
+                now            = now,
+                frame          = vis,
             )
             carried_ids = conceal.being_carried_ids()
 
             # ── Goods zone guard update ────────────────────────────────────
+            # Mỗi zone có một state machine riêng để quyết định có alert thật hay không.
             for zd in zones_px:
                 zname = zd["name"]
-                pts = zd["pts"]
+                pts   = zd["pts"]
                 guard = zone_guards.get(zname)
                 if guard is None: continue
 
                 zone_items_stable = items_inside_zone(last_det_items_stable, pts)
-                stable_count = len(zone_items_stable)
+                stable_count      = len(zone_items_stable)
 
                 zone_items_raw = items_inside_zone(last_det_items_raw, pts)
-                raw_count = len(zone_items_raw)
+                raw_count      = len(zone_items_raw)
 
                 interaction_items = zone_items_raw if zone_items_raw else zone_items_stable
 
@@ -2019,16 +1733,16 @@ def main():
                 # false loss. Staff only triggers a refresh after entering and
                 # then leaving the zone.
                 cooldown_blocked = staff_interacting or (
-                        unknown_interacting and not args.unknown_as_guest
+                    unknown_interacting and not args.unknown_as_guest
                 )
 
                 guard.update(
-                    guest_interacting=guest_interacting,
-                    stable_item_count=stable_count,
-                    now=now,
-                    staff_interacting=staff_interacting,
-                    raw_item_count=raw_count,
-                    cooldown_blocked=cooldown_blocked,
+                    guest_interacting  = guest_interacting,
+                    stable_item_count  = stable_count,
+                    now                = now,
+                    staff_interacting  = staff_interacting,
+                    raw_item_count     = raw_count,
+                    cooldown_blocked   = cooldown_blocked,
                 )
 
                 for event_name in guard.pop_events():
@@ -2038,6 +1752,8 @@ def main():
                     elif event_name == "discard_snapshot":
                         ha.discard_staged(kind)
 
+                # Staff rời zone là điểm cần re-baseline vì staff có thể refill/dọn hàng.
+                # Ta xóa ghost/pinned cũ trước để baseline mới phản ánh thực tế.
                 # Staff left zone → remove pinned ghosts (staff may have
                 # added or removed items) then re-baseline with real count.
                 if guard.staff_reset_needed:
@@ -2055,39 +1771,32 @@ def main():
 
             for zd in zones_px:
                 zname = zd["name"]
-                poly = np.array(zd["pts"], dtype=np.int32)
+                poly  = np.array(zd["pts"], dtype=np.int32)
                 guard = zone_guards.get(zname)
 
                 zone_items_stable = items_inside_zone(last_det_items_stable, zd["pts"])
-                visible_now = len(zone_items_stable)
+                visible_now       = len(zone_items_stable)
 
                 if guard is not None and guard.is_alerting:
-                    zc = (0, 0, 255);
-                    al = 0.18
+                    zc = (0, 0, 255);   al = 0.18
                 elif guard is not None and guard.person_blocking:
-                    zc = (0, 140, 255);
-                    al = 0.10
+                    zc = (0, 140, 255); al = 0.10
                 else:
-                    zc = (0, 255, 255);
-                    al = 0.06
+                    zc = (0, 255, 255); al = 0.06
 
-                ov = vis.copy();
-                cv2.fillPoly(ov, [poly], zc)
+                ov = vis.copy(); cv2.fillPoly(ov, [poly], zc)
                 cv2.addWeighted(ov, al, vis, 1 - al, 0, vis)
                 cv2.polylines(vis, [poly], True, zc, 1)
 
                 if guard is not None and guard.person_blocking:
-                    shown = guard.baseline_count;
-                    sfx = " [FROZEN]"
+                    shown = guard.baseline_count; sfx = " [FROZEN]"
                 elif guard is not None and guard.is_alerting:
                     shown = max(0, guard.baseline_count - guard.missing)
-                    sfx = f" [-{guard.missing}!]"
+                    sfx   = f" [-{guard.missing}!]"
                 else:
-                    shown = visible_now;
-                    sfx = ""
+                    shown = visible_now; sfx = ""
 
-                tx, ty = poly_label_anchor(zd["pts"]);
-                ty = max(14, ty + 16)
+                tx, ty = poly_label_anchor(zd["pts"]); ty = max(14, ty + 16)
                 if args.show_breakdown:
                     guest_cnt = sum(
                         1 for p in last_pose_people
@@ -2108,16 +1817,16 @@ def main():
                     lbl = f"{zname} I={shown}{sfx}"
 
                 (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, _fsl, 1)
-                cv2.rectangle(vis, (max(0, tx - 3), max(0, ty - th - 3)),
-                              (min(W - 1, tx + tw + 6), min(H - 1, ty + 3)), (0, 0, 0), -1)
+                cv2.rectangle(vis, (max(0, tx-3), max(0, ty-th-3)),
+                              (min(W-1, tx+tw+6), min(H-1, ty+3)), (0,0,0), -1)
                 cv2.putText(vis, lbl, (tx, ty),
                             cv2.FONT_HERSHEY_SIMPLEX, _fsl, zc, 1, cv2.LINE_AA)
                 big = str(shown)
                 (bw, bh), _ = cv2.getTextSize(big, cv2.FONT_HERSHEY_SIMPLEX, _fsc, 2)
                 cy_ = min(H - 6, ty + bh + 8)
-                cv2.rectangle(vis, (tx - 2, cy_ - bh - 3),
-                              (min(W - 1, tx + bw + 6), cy_ + 3), (0, 0, 0), -1)
-                cv2.putText(vis, big, (tx + 2, cy_),
+                cv2.rectangle(vis, (tx-2, cy_-bh-3),
+                              (min(W-1, tx+bw+6), cy_+3), (0,0,0), -1)
+                cv2.putText(vis, big, (tx+2, cy_),
                             cv2.FONT_HERSHEY_SIMPLEX, _fsc, zc, 2, cv2.LINE_AA)
 
             # ── Draw items ─────────────────────────────────────────────────
@@ -2125,21 +1834,21 @@ def main():
                 _fsi = max(0.30, min(0.42, H / 900))
                 for it in last_det_items_vis:
                     x1, y1, x2, y2 = [int(v) for v in it["bbox"]]
-                    tid = it.get("track_id")
-                    ghost = it.get("ghost", False)
+                    tid    = it.get("track_id")
+                    ghost  = it.get("ghost",  False)
                     pinned = it.get("pinned", False)
                     in_zone = item_in_any_zone(it, last_goods_zones_px) is not None
 
                     if tid in carried_ids:
-                        color = (0, 0, 255)  # red    = being carried
+                        color = (0, 0, 255)       # red    = being carried
                     elif pinned and ghost:
-                        color = (0, 180, 255)  # orange = pinned zone ghost
+                        color = (0, 180, 255)      # orange = pinned zone ghost
                     elif ghost:
-                        color = (100, 100, 100)  # grey   = normal ghost
+                        color = (100, 100, 100)    # grey   = normal ghost
                     elif in_zone:
-                        color = (0, 220, 0)  # green  = live in zone
+                        color = (0, 220, 0)        # green  = live in zone
                     else:
-                        color = (0, 128, 255)  # blue   = live outside zone
+                        color = (0, 128, 255)      # blue   = live outside zone
 
                     # Dashed border for pinned ghosts → visually distinct
                     if pinned and ghost:
@@ -2148,17 +1857,15 @@ def main():
                         cv2.rectangle(vis, (x1, y1), (x2, y2), color, 1)
 
                     lbl = f"#{tid}" if tid is not None else ""
-                    if pinned and ghost:
-                        lbl += " [P]"
-                    elif ghost:
-                        lbl += " [G]"
+                    if pinned and ghost:   lbl += " [P]"
+                    elif ghost:            lbl += " [G]"
                     if tid in carried_ids: lbl += " CARRIED!"
                     lbl += f" {it['conf']:.2f}"
                     (iw, ih), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, _fsi, 1)
                     lx, ly = x1, max(ih + 2, y1 - 2)
-                    cv2.rectangle(vis, (lx, ly - ih - 2),
-                                  (min(W - 1, lx + iw + 4), ly + 2), (0, 0, 0), -1)
-                    cv2.putText(vis, lbl, (lx + 2, ly),
+                    cv2.rectangle(vis, (lx, ly-ih-2),
+                                  (min(W-1, lx+iw+4), ly+2), (0,0,0), -1)
+                    cv2.putText(vis, lbl, (lx+2, ly),
                                 cv2.FONT_HERSHEY_SIMPLEX, _fsi, color, 1, cv2.LINE_AA)
 
                 for rd in last_role_dets:
@@ -2166,12 +1873,13 @@ def main():
                     rc = ROLE_COLORS.get(rd["name"], (200, 200, 200))
                     cv2.rectangle(vis, (x1, y1), (x2, y2), rc, 1)
                     cv2.putText(vis, f"[det]{rd['name']} {rd['conf']:.2f}",
-                                (x1, max(10, y1 - 2)),
+                                (x1, max(10, y1-2)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.32, rc, 1, cv2.LINE_AA)
 
             # Alert messages stay in console / Home Assistant only.
 
             # ── Home Assistant ─────────────────────────────────────────────
+            # Chỉ gửi alert khi có chuyển trạng thái mới, tránh spam cùng một cảnh báo mỗi frame.
             curr_alerting_zones = {
                 zname for zname, g in zone_guards.items()
                 if g is not None and g.is_alerting
@@ -2189,22 +1897,21 @@ def main():
             if curr_conceal_count > _prev_conceal_count:
                 for a in conceal.alerts[_prev_conceal_count:]:
                     zone_name = a.get("zone_name", "")
-                    snap = a.get("snapshot")
+                    snap      = a.get("snapshot")
                     if zone_name:
                         ha.send_alert(
-                            kind=f"zone_{zone_name}",
-                            message=a["msg"],
-                            frame=snap if snap is not None else vis.copy(),
-                            now=now,
+                            kind    = f"zone_{zone_name}",
+                            message = a["msg"],
+                            frame   = snap if snap is not None else vis.copy(),
+                            now     = now,
                         )
             _prev_conceal_count = curr_conceal_count
 
             # ── FPS overlay ────────────────────────────────────────────────
             disp_frames += 1
             if now - disp_last >= 1.0:
-                disp_fps = disp_frames / (now - disp_last)
-                disp_frames = 0;
-                disp_last = now
+                disp_fps    = disp_frames / (now - disp_last)
+                disp_frames = 0; disp_last = now
             if args.draw_fps:
                 txt = (f"DISP {disp_fps:.1f} | POSE {pose_fps:.1f} "
                        f"| DET {det_fps:.1f} | IN {args.ffmpeg_fps:.1f}")
