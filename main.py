@@ -1,3 +1,26 @@
+"""
+Anti-theft multi-zone monitoring pipeline.
+
+This module combines:
+- FFmpeg frame ingestion for RTSP/video input
+- YOLO item detection and role detection (staff/guest)
+- YOLO pose estimation for wrist-based zone interaction logic
+- Stable item tracking with ghost / pinned behavior
+- Goods removal detection and concealment detection
+- Home Assistant state updates, media upload, and webhook notifications
+
+Design goals:
+- Prefer stable, explainable logic over aggressive but noisy detection
+- Keep anti-theft alerts zone-aware and role-aware
+- Preserve enough visual evidence (snapshot / clip) for later review
+- Integrate cleanly with Home Assistant for automations and dashboards
+
+Author notes:
+- Coordinate system: OpenCV pixel space unless stated otherwise
+- Zone definitions are normalized [0..1] in JSON, then scaled per frame
+- Most time values are in seconds and based on time.time()
+"""
+
 import os, json, time, argparse, subprocess, threading, re, collections
 from urllib.parse import quote
 import cv2
@@ -16,6 +39,22 @@ except ImportError:
 # Home Assistant Notifier
 # ─────────────────────────────────────────────────────────────
 class HomeAssistantNotifier:
+    """Push anti-theft events into Home Assistant.
+
+    Responsibilities:
+    - create/update one HA sensor per anti-theft zone
+    - save staged snapshots / short clips locally
+    - optionally upload media into HA /media for remote access
+    - fire webhook payloads for downstream HA automations
+    - keep ALERT state alive for a configurable hold period before OK
+
+    Important behavior:
+    - `notify_cooldown_s` prevents repeated alert spam per entity
+    - `alert_hold_sec` keeps the sensor in ALERT after the last alert
+    - `stage_snapshot()` stores evidence before theft is fully confirmed
+    - `clear_alert()` does not always clear immediately; it may defer clear
+      until the configured hold window ends
+    """
     SENSOR_PREFIX = "sensor.antitheft_"
     MAX_SNAPSHOT_FILES = 100
 
@@ -50,6 +89,7 @@ class HomeAssistantNotifier:
         self._init_sensors(zone_names or [])
 
     def _init_sensors(self, zone_names):
+        """Create / prime one HA sensor entity for each configured goods zone."""
         for z in zone_names:
             entity_id = self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_",
                                                      f"zone_{z}".lower())
@@ -59,6 +99,7 @@ class HomeAssistantNotifier:
             print(f"[HA] Initialized sensor -> {entity_id} = None")
 
     def push_frame(self, frame, ts):
+        """Append a rendered frame into the rolling clip buffer used for HA clips."""
         if self.clip_duration_s <= 0: return
         with self._frame_buf_lock:
             self._frame_buf.append((frame, ts))
@@ -67,6 +108,7 @@ class HomeAssistantNotifier:
                 self._frame_buf.popleft()
 
     def _prune_snapshot_files(self, keep_paths=None):
+        """Delete old JPG snapshots when local evidence storage exceeds the cap."""
         if not self.snapshot_dir:
             return
         keep = {os.path.abspath(p) for p in (keep_paths or []) if p}
@@ -98,6 +140,7 @@ class HomeAssistantNotifier:
             print(f"[HA] Snapshot prune error: {e}")
 
     def _save_snapshot(self, frame, label):
+        """Save a JPEG snapshot to the local snapshot directory and return its path."""
         if not self.snapshot_dir or frame is None: return ""
         ts_str = time.strftime("%Y%m%d_%H%M%S")
         safe   = re.sub(r"[^a-zA-Z0-9_]", "_", label)
@@ -107,6 +150,11 @@ class HomeAssistantNotifier:
         return path
 
     def stage_snapshot(self, kind, frame):
+        """Save preliminary evidence for a zone before alert confirmation.
+
+        This is used when a guest first interacts with a goods zone. If theft is
+        later confirmed, the staged snapshot can be re-used as the alert image.
+        """
         if not self.snapshot_dir or frame is None:
             return ""
         staged = self._staged_media.get(kind)
@@ -124,6 +172,7 @@ class HomeAssistantNotifier:
         return snap_path
 
     def discard_staged(self, kind):
+        """Delete and forget any staged snapshot when the interaction resolves cleanly."""
         staged = self._staged_media.pop(kind, None)
         if not staged:
             return
@@ -136,6 +185,7 @@ class HomeAssistantNotifier:
                 pass
 
     def _consume_staged_snapshot(self, kind):
+        """Return the staged snapshot path for an alert and remove it from staging."""
         staged = self._staged_media.pop(kind, None)
         if not staged:
             return ""
@@ -143,6 +193,7 @@ class HomeAssistantNotifier:
         return snap_path if snap_path and os.path.exists(snap_path) else ""
 
     def _save_clip(self, label):
+        """Encode the recent buffered frames into a short MP4 evidence clip."""
         if self.clip_duration_s <= 0 or not self.snapshot_dir: return ""
         with self._frame_buf_lock:
             frames = list(self._frame_buf)
@@ -158,16 +209,19 @@ class HomeAssistantNotifier:
         return path
 
     def _sanitize_media_filename(self, filename):
+        """Normalize upload filenames so they are safe for HA media storage."""
         base = os.path.basename(str(filename or "media.bin"))
         safe = re.sub(r"[^a-zA-Z0-9._-]", "_", base)
         return safe or "media.bin"
 
     def _media_content_id_for_upload(self):
+        """Build the HA media_source target ID for the configured upload folder."""
         if self.media_dir:
             return f"media-source://media_source/local/{self.media_dir}"
         return "media-source://media_source/local"
 
     def _media_content_id_to_relative_url(self, media_content_id):
+        """Convert HA media_source IDs into `/media/local/...` URLs for clients."""
         prefix = "media-source://media_source/local"
         if not media_content_id or not media_content_id.startswith(prefix):
             return ""
@@ -178,6 +232,7 @@ class HomeAssistantNotifier:
         return "/media/local/" + "/".join(parts)
 
     def _upload_file_to_ha_media(self, local_path):
+        """Upload a local snapshot/clip into HA media storage and return its relative URL."""
         if not self._enabled or not self.upload_media or not local_path or not os.path.exists(local_path):
             return ""
 
@@ -221,6 +276,7 @@ class HomeAssistantNotifier:
             return ""
 
     def _update_sensor(self, entity_id, state, attributes):
+        """POST one sensor state update to Home Assistant."""
         url = f"{self.ha_url}/api/states/{entity_id}"
         try:
             r = _requests.post(url, headers=self._headers,
@@ -231,6 +287,7 @@ class HomeAssistantNotifier:
             print(f"[HA] Sensor update error: {e}")
 
     def _fire_webhook(self, data):
+        """Trigger the optional HA webhook endpoint with an alert payload."""
         if not self.webhook_id: return
         url = f"{self.ha_url}/api/webhook/{self.webhook_id}"
         try:
@@ -241,20 +298,24 @@ class HomeAssistantNotifier:
             print(f"[HA] Webhook error: {e}")
 
     def _entity_id_for_kind(self, kind):
+        """Map an alert kind such as `zone_zone1` into a stable HA entity_id."""
         return self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_", str(kind).lower())
 
     def _friendly_name_for_kind(self, kind):
+        """Return a user-facing friendly name used in HA state attributes."""
         kind = str(kind or "")
         if kind.startswith("zone_"):
             return f"Anti-Theft Zone: {kind[5:]}"
         return f"Anti-Theft: {kind}"
 
     def _kind_from_entity_id(self, entity_id):
+        """Recover the internal alert kind from a full HA entity_id."""
         if entity_id.startswith(self.SENSOR_PREFIX):
             return entity_id[len(self.SENSOR_PREFIX):]
         return entity_id
 
     def _write_ok_state(self, entity_id, now=None):
+        """Write a clean OK state after the alert hold period expires."""
         now = time.time() if now is None else now
         kind = self._kind_from_entity_id(entity_id)
         attrs = {
@@ -269,6 +330,7 @@ class HomeAssistantNotifier:
         self._update_sensor(entity_id, "OK", attrs)
 
     def process_pending_clears(self, now=None):
+        """Finalize delayed OK transitions once their hold timer has expired."""
         if not self._enabled:
             return
         now = time.time() if now is None else now
@@ -283,6 +345,23 @@ class HomeAssistantNotifier:
 
     def send_alert(self, kind, message, frame, now, use_staged_snapshot=False,
                    snapshot_path=""):
+        """Publish a new alert to HA, save/upload evidence, and extend ALERT hold time.
+
+        Parameters
+        ----------
+        kind : str
+            Internal alert channel, typically `zone_<name>`.
+        message : str
+            Human-readable alert message written into HA sensor attributes.
+        frame : np.ndarray
+            BGR image used to generate fallback snapshots/clips.
+        now : float
+            Unix timestamp from `time.time()`.
+        use_staged_snapshot : bool
+            Reuse a previously staged snapshot if available.
+        snapshot_path : str
+            Explicit local snapshot path to use instead of generating one.
+        """
         if not self._enabled: return
         entity_id = self._entity_id_for_kind(kind)
         last = self._last_notify.get(entity_id, 0.0)
@@ -327,6 +406,7 @@ class HomeAssistantNotifier:
         print(f"[HA] Sent alert -> {entity_id}  snap={snap_url or snap_path} clip={clip_url or clip_path}{hold_txt}")
 
     def clear_alert(self, kind, now=None):
+        """Request transition of an HA alert back to OK, honoring hold semantics."""
         self.discard_staged(kind)
         if not self._enabled:
             return
@@ -360,6 +440,7 @@ def poly_label_anchor(pts):
 def dist2(a, b): return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
 
 def load_zones(zones_path):
+    """Load normalized polygon zones from JSON and validate required fields."""
     with open(zones_path, "r", encoding="utf-8") as f:
         zdata = json.load(f)
     zones = zdata.get("zones", [])
@@ -373,6 +454,7 @@ def load_zones(zones_path):
 def is_rtsp(src): return src.lower().startswith("rtsp://")
 
 def probe_size_with_ffprobe(src, ffprobe_path="ffprobe", timeout_s=6):
+    """Probe the source stream resolution using ffprobe. Returns (width, height)."""
     try:
         cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0",
                "-show_entries", "stream=width,height", "-of", "json", src]
@@ -478,6 +560,7 @@ def draw_pose_skeleton(vis, kpts, color=(255, 80, 80)):
 # Body bbox / torso / elbow / shoulder entering the polygon is ignored.
 # ─────────────────────────────────────────────────────────────
 def wrists_inside_zone(person, zone_pts):
+    """Return wrist points that lie inside the goods-zone polygon."""
     inside = []
     for ki in (KP_L_WRIST, KP_R_WRIST):
         wx, wy = person["kpts"][ki]
@@ -487,6 +570,11 @@ def wrists_inside_zone(person, zone_pts):
 
 
 def person_interacts_with_goods_zone(person, zone_pts, zone_items, reach_dist=55):
+    """Decide whether a person is meaningfully interacting with a goods zone.
+
+    Only wrists are allowed to activate the zone. Body / torso / elbow overlap is
+    intentionally ignored to reduce false positives from standing nearby.
+    """
     wrists_in_zone = wrists_inside_zone(person, zone_pts)
     if not wrists_in_zone:
         return False
@@ -525,6 +613,12 @@ def person_interacts_with_goods_zone(person, zone_pts, zone_items, reach_dist=55
 #   single stray detections.
 # ─────────────────────────────────────────────────────────────
 class PersonRoleTracker:
+    """Track and stabilize person roles (staff / guest / unknown) over time.
+
+    The tracker uses a sliding time window instead of consecutive-frame
+    confirmation. This makes role confirmation resilient to flicker, blur, short
+    occlusions, and intermittent role detections.
+    """
     def __init__(self,
                  confirm_count: int    = 2,
                  candidate_window_s: float = 8.0,
@@ -604,6 +698,7 @@ class PersonRoleTracker:
         return assignments
 
     def update(self, persons, role_detections, now):
+        """Match persons↔tracks↔role detections and update stable role labels."""
         # 1. Match persons to tracks
         track_assign = self._match_persons_to_tracks(persons)
         for pi, p in enumerate(persons):
@@ -712,6 +807,13 @@ class PersonRoleTracker:
 # Non-zone items: unchanged — expire after ghost_ttl seconds.
 # ─────────────────────────────────────────────────────────────
 class StableItemTracker:
+    """Maintain stable item identities, ghost persistence, and zone pinning.
+
+    Purpose:
+    - bridge temporary detector dropouts
+    - keep items in goods zones visually stable while briefly occluded
+    - support finite pin TTL so weak one-off detections do not remain forever
+    """
     def __init__(self, pos_thresh: float = 45.0, ghost_ttl: float = 3.0,
                  pin_ttl: float = 0.0):
         self.pos_thresh = float(pos_thresh)
@@ -721,6 +823,7 @@ class StableItemTracker:
         self._next_sid  = 1
 
     def _make_rec(self, it: dict, now: float) -> dict:
+        """Create one registry record for a newly observed item."""
         return {
             "center":    it["center"],
             "bbox":      list(it["bbox"]),
@@ -732,6 +835,7 @@ class StableItemTracker:
         }
 
     def _best_pos_match(self, cx: float, cy: float, used: set):
+        """Find the nearest existing item record within the position threshold."""
         best_sid  = None
         best_dist = float("inf")
         for sid, rec in self._reg.items():
@@ -836,6 +940,7 @@ class StableItemTracker:
         return real_items + ghost_items, real_items
 
     def remove_zone_ghosts(self, zone_pts: list):
+        """Delete ghost/pinned entries inside a zone after theft confirmation or refresh."""
         """Remove ALL ghost items (including pinned) from this zone.
         Called after GoodsZoneGuard confirms theft."""
         for sid in list(self._reg.keys()):
@@ -848,6 +953,21 @@ class StableItemTracker:
 # Goods Zone Guard  (unchanged logic)
 # ─────────────────────────────────────────────────────────────
 class GoodsZoneGuard:
+    """Finite-state machine for goods-removal detection inside a single zone.
+
+    States
+    ------
+    IDLE
+        Normal monitoring with baseline item counting.
+    GUEST_INTERACT
+        A guest wrist is interacting with the zone.
+    OCCLUDED_HOLD
+        Zone is still occupied, so do not finalize a count yet.
+    COOLDOWN
+        Wait for people to clear the zone and verify final item count.
+    ALERT
+        Confirmed missing-item state.
+    """
     IDLE           = 0
     GUEST_INTERACT = 1
     OCCLUDED_HOLD  = 2
@@ -879,6 +999,7 @@ class GoodsZoneGuard:
         self._events.append(event_name)
 
     def pop_events(self):
+        """Return and clear queued side-effect events for the main loop."""
         out = list(self._events)
         self._events.clear()
         return out
@@ -912,6 +1033,7 @@ class GoodsZoneGuard:
         self.state = self.COOLDOWN
 
     def force_rebaseline(self, raw_item_count: int):
+        """Reset the zone baseline after staff legitimately changes the display."""
         """Called by main loop after staff leaves zone.
         Clears ALL pinned ghosts (already done externally) and re-builds
         the baseline from the actual detected item count."""
@@ -930,6 +1052,7 @@ class GoodsZoneGuard:
                guest_present: bool = False,
                staff_present: bool = False,
                unknown_present: bool = False):
+        """Advance the zone state machine and detect confirmed goods removal."""
         stable_item_count = int(stable_item_count)
         check_count = int(raw_item_count) if raw_item_count is not None else stable_item_count
 
@@ -1022,6 +1145,11 @@ class GoodsZoneGuard:
 # Concealment Tracker  (ZONE-ONLY, GUEST-ONLY — unchanged logic)
 # ─────────────────────────────────────────────────────────────
 class ConcealmentTracker:
+    """Detect concealment events after guest contact with a zone item.
+
+    The tracker arms only after guest wrist contact is strong enough and the item
+    later disappears while the zone has become visually clear of people.
+    """
     ALERT_DISPLAY = 10.0
 
     def __init__(self, carry_dist=90, carry_frames=3, move_thresh=18,
@@ -1086,6 +1214,7 @@ class ConcealmentTracker:
     def update(self, items: list, people: list,
                goods_zones_px: list, now: float, frame=None,
                role_detections=None):
+        """Update carry/concealment evidence and append new concealment alerts."""
         role_detections = role_detections or []
         current_ids = {it["track_id"] for it in items
                        if it.get("track_id") is not None}
@@ -1232,6 +1361,7 @@ class ConcealmentTracker:
         self.alerts = [a for a in self.alerts if (now - a["ts"]) < self.ALERT_DISPLAY]
 
     def being_carried_ids(self) -> set:
+        """Return item IDs currently considered to be carried by a guest."""
         return {tid for tid, r in self._items.items() if r["being_carried"]}
 
 
@@ -1239,6 +1369,7 @@ class ConcealmentTracker:
 # Alert overlay renderer
 # ─────────────────────────────────────────────────────────────
 def draw_alerts(vis, zone_guards_list, conceal, now):
+    """Render active alert messages as a bottom overlay on the preview frame."""
     H, W = vis.shape[:2]
     msgs = []
     for zg in zone_guards_list:
@@ -1268,6 +1399,7 @@ def draw_alerts(vis, zone_guards_list, conceal, now):
 # Dashed rectangle for pinned-ghost zone items
 # ─────────────────────────────────────────────────────────────
 def draw_dashed_rect(img, pt1, pt2, color, thickness=1, dash_len=8):
+    """Draw a dashed rectangle used to visualize pinned ghost items."""
     x1, y1 = pt1; x2, y2 = pt2
     edges = [(x1, y1, x2, y1), (x2, y1, x2, y2),
              (x2, y2, x1, y2), (x1, y2, x1, y1)]
@@ -1287,6 +1419,7 @@ def draw_dashed_rect(img, pt1, pt2, color, thickness=1, dash_len=8):
 # FFmpeg reader
 # ─────────────────────────────────────────────────────────────
 def build_ffmpeg_cmd(src, out_w, out_h, out_fps, ffmpeg_path, timeout_us, disabled_opts):
+    """Build the FFmpeg command line for low-latency raw-frame extraction."""
     vf_parts = []
     if out_w > 0 and out_h > 0: vf_parts.append(f"scale={out_w}:{out_h}")
     if out_fps > 0:              vf_parts.append(f"fps={out_fps}")
@@ -1305,6 +1438,11 @@ def build_ffmpeg_cmd(src, out_w, out_h, out_fps, ffmpeg_path, timeout_us, disabl
 _UNREC_RE = re.compile(r"Unrecognized option '([^']+)'\.", re.IGNORECASE)
 
 class FFmpegLatestFrameReader:
+    """Continuously read the latest decoded frame from FFmpeg in a background thread.
+
+    The reader auto-restarts FFmpeg on failure and can disable unsupported input
+    options dynamically when FFmpeg reports `Unrecognized option`.
+    """
     def __init__(self, src, width, height, out_fps, timeout_us, ffmpeg_path="ffmpeg"):
         self.src = src; self.w = int(width); self.h = int(height)
         self.out_fps = float(out_fps); self.timeout_us = int(timeout_us)
@@ -1317,18 +1455,23 @@ class FFmpegLatestFrameReader:
         self._restart_requested = False
 
     def start(self):
+        """Start the background reader thread."""
         self.running = True
         self.thread  = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
-    def stop(self): self.running = False; self._kill_proc()
+    def stop(self):
+        """Stop background reading and terminate the FFmpeg subprocess."""
+        self.running = False; self._kill_proc()
 
     def get_latest(self):
+        """Return a copy of the latest frame, its timestamp, and frame counter."""
         with self.lock:
             if self.latest is None: return None, 0.0, 0
             return self.latest.copy(), self.latest_ts, self.frame_id
 
     def _kill_proc(self):
+        """Kill the active FFmpeg subprocess and close its pipes safely."""
         p, self.proc = self.proc, None
         if p is None: return
         try: p.kill()
@@ -1340,11 +1483,13 @@ class FFmpegLatestFrameReader:
             except: pass
 
     def _map_opt(self, opt):
+        """Normalize FFmpeg option names reported by stderr into internal keys."""
         opt = opt.strip().lstrip("-")
         return {"timeout": "timeout", "stimeout": "timeout", "fflags": "fflags",
                 "err_detect": "err_detect", "max_delay": "max_delay"}.get(opt, opt)
 
     def _stderr_loop(self, proc):
+        """Read FFmpeg stderr, capture errors, and request auto-restarts if needed."""
         try:
             while self.running and proc and proc.stderr:
                 line = proc.stderr.readline()
@@ -1362,6 +1507,7 @@ class FFmpegLatestFrameReader:
         except: pass
 
     def _start_proc(self):
+        """Launch a fresh FFmpeg subprocess with the currently enabled options."""
         cmd = build_ffmpeg_cmd(self.src, self.w, self.h, self.out_fps,
                                self.ffmpeg_path, self.timeout_us, self.disabled_opts)
         cf = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -1373,10 +1519,12 @@ class FFmpegLatestFrameReader:
         threading.Thread(target=self._stderr_loop, args=(proc,), daemon=True).start()
 
     def _restart_proc(self):
+        """Restart FFmpeg with a small backoff to avoid rapid restart loops."""
         if time.time() - self.last_restart_ts < 0.4: time.sleep(0.4)
         self._kill_proc(); self._start_proc()
 
     def _read_exact(self, n):
+        """Read exactly `n` bytes from FFmpeg stdout or return None on failure."""
         buf = b""
         while len(buf) < n and self.running and self.proc and self.proc.stdout:
             chunk = self.proc.stdout.read(n - len(buf))
@@ -1385,6 +1533,7 @@ class FFmpegLatestFrameReader:
         return buf if len(buf) == n else None
 
     def _loop(self):
+        """Main reader loop: keep FFmpeg alive and publish the latest frame."""
         self._start_proc()
         while self.running:
             if self.proc is None: self._restart_proc(); continue
@@ -1405,11 +1554,13 @@ class FFmpegLatestFrameReader:
 # TrackBuffer  (visual ghost buffer for smooth display)
 # ─────────────────────────────────────────────────────────────
 class TrackBuffer:
+    """Small visual ghost buffer that smooths item rendering between frames."""
     def __init__(self, ghost_frames=6):
         self.ghost_frames = ghost_frames
         self._buf: dict   = {}
 
     def update(self, detected_items: list) -> list:
+        """Keep recently seen items visible for a few frames even if detection flickers."""
         now_ids = set()
         for it in detected_items:
             tid = it.get("track_id")
@@ -1429,6 +1580,7 @@ class TrackBuffer:
         return out
 
     def remove_zone_items(self, zone_pts: list):
+        """Flush buffered visual ghosts inside a zone immediately."""
         """Immediately flush visual ghosts for a zone.
         Used when staff refreshes a zone or after theft is confirmed so the
         old pinned bbox/ID disappears right away instead of lingering for a
@@ -1441,6 +1593,7 @@ class TrackBuffer:
 
 
 def filter_contained_boxes(items, iou_min_thresh=0.6):
+    """Suppress nested duplicate item boxes using intersection-over-min-area."""
     if len(items) < 2: return items
     def box_area(b): return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
     def intersection(b1, b2):
@@ -1485,6 +1638,7 @@ def sahi_infer(model, frame, target_cls=None,
                slice_h=320, slice_w=320, overlap=0.2,
                conf=0.1, imgsz=640, nms_iou=0.5,
                merge_full=False):
+    """Run tiled SAHI-style inference for small-object detection and merge with NMS."""
     """
     Trả về list of dict:
         {"bbox": np.array([x1,y1,x2,y2]), "conf": float, "cls_id": int, "cls_name": str}
@@ -1572,38 +1726,65 @@ def sahi_infer(model, frame, target_cls=None,
 # Main
 # ─────────────────────────────────────────────────────────────
 def main():
+    """Entry point: parse CLI args, initialize models, and run the monitoring loop."""
     ap = argparse.ArgumentParser("Anti-theft")
-    ap.add_argument("--rtsp",  default="rtsp://admin:KOEYHZ@192.168.2.72:554/cam/realmonitor?channel=1&subtype=1")
-    ap.add_argument("--video", default="")
-    ap.add_argument("--zones", default="zones.json")
-    ap.add_argument("--det_model",  required=True)
-    ap.add_argument("--pose_model", required=True)
-    ap.add_argument("--imgsz",     type=int,   default=640)
+    ap.add_argument("--rtsp",  default="rtsp://admin:KOEYHZ@192.168.2.72:554/cam/realmonitor?channel=1&subtype=1",
+                    help="RTSP source URL. Used when --video is empty.")
+    ap.add_argument("--video", default="",
+                    help="Path to a local video file for offline testing. Overrides nothing unless --rtsp is empty.")
+    ap.add_argument("--zones", default="zones.json",
+                    help="Path to zones.json containing normalized polygon definitions.")
+    ap.add_argument("--det_model",  required=True,
+                    help="Path to the YOLO detection model used for items and role detections.")
+    ap.add_argument("--pose_model", required=True,
+                    help="Path to the YOLO pose model used for wrist-based interaction logic.")
+    ap.add_argument("--imgsz",     type=int,   default=640,
+                    help="Inference image size passed to YOLO predict/track.")
     ap.add_argument("--conf_det",  type=float, default=0.4,
                     help="Confidence threshold for det_model items (default 0.4)")
     ap.add_argument("--conf_role", type=float, default=0.8,
                     help="Confidence threshold for staff/guest detections. Raise this when staff sometimes flips to guest (default 0.72).")
     ap.add_argument("--conf_pose", type=float, default=0.1)
-    ap.add_argument("--ffmpeg_path",  default="ffmpeg")
-    ap.add_argument("--ffprobe_path", default="ffprobe")
-    ap.add_argument("--out_width",  type=int,   default=0)
-    ap.add_argument("--out_height", type=int,   default=0)
-    ap.add_argument("--ffmpeg_fps", type=float, default=12.0)
-    ap.add_argument("--timeout_us", type=int,   default=10_000_000)
-    ap.add_argument("--pose_fps",   type=float, default=4.0)
-    ap.add_argument("--det_fps",    type=float, default=6.0)
-    ap.add_argument("--carry_dist",   type=int,   default=40)
-    ap.add_argument("--carry_frames", type=int,   default=3)
-    ap.add_argument("--move_thresh",  type=int,   default=18)
-    ap.add_argument("--grasp_dist",   type=int,   default=24)
-    ap.add_argument("--conceal_verify_sec", type=float, default=1.2)
-    ap.add_argument("--cooldown_sec", type=float, default=4)
-    ap.add_argument("--exit_settle_sec", type=float, default=0.5)
-    ap.add_argument("--goods_zone_names", default="zone1,zone2")
-    ap.add_argument("--guest_reach_dist", type=int, default=55)
-    ap.add_argument("--unknown_as_guest", action="store_true", default=False)
-    ap.add_argument("--no_unknown_as_guest", dest="unknown_as_guest", action="store_false")
-    ap.add_argument("--stable_pos_thresh", type=float, default=45.0)
+    ap.add_argument("--ffmpeg_path",  default="ffmpeg",
+                    help="Path to the ffmpeg executable used for stream decoding.")
+    ap.add_argument("--ffprobe_path", default="ffprobe",
+                    help="Path to the ffprobe executable used to probe stream resolution.")
+    ap.add_argument("--out_width",  type=int,   default=0,
+                    help="Optional output width for FFmpeg scaling. 0 = auto/original.")
+    ap.add_argument("--out_height", type=int,   default=0,
+                    help="Optional output height for FFmpeg scaling. 0 = auto/original.")
+    ap.add_argument("--ffmpeg_fps", type=float, default=12.0,
+                    help="Target decode/display FPS requested from FFmpeg.")
+    ap.add_argument("--timeout_us", type=int,   default=10_000_000,
+                    help="RTSP socket timeout passed to FFmpeg in microseconds.")
+    ap.add_argument("--pose_fps",   type=float, default=4.0,
+                    help="Maximum rate for pose inference. Lower values save CPU.")
+    ap.add_argument("--det_fps",    type=float, default=6.0,
+                    help="Maximum rate for detection inference. Lower values save CPU.")
+    ap.add_argument("--carry_dist",   type=int,   default=40,
+                    help="Max wrist-to-item distance (px) to consider contact/carry evidence.")
+    ap.add_argument("--carry_frames", type=int,   default=3,
+                    help="Frames of sustained guest contact before an item can be marked as carried.")
+    ap.add_argument("--move_thresh",  type=int,   default=18,
+                    help="Minimum item movement (px) from anchor point to count as actual pickup motion.")
+    ap.add_argument("--grasp_dist",   type=int,   default=24,
+                    help="Stronger wrist-to-item proximity threshold (px) for grasp confirmation.")
+    ap.add_argument("--conceal_verify_sec", type=float, default=1.2,
+                    help="How long the zone must remain clear after disappearance before concealment is confirmed.")
+    ap.add_argument("--cooldown_sec", type=float, default=4,
+                    help="Verification window after zone clearance before goods removal is confirmed.")
+    ap.add_argument("--exit_settle_sec", type=float, default=0.5,
+                    help="Delay after a person leaves the zone before starting final count verification.")
+    ap.add_argument("--goods_zone_names", default="zone1,zone2",
+                    help="Comma-separated zone names that should behave as monitored goods zones.")
+    ap.add_argument("--guest_reach_dist", type=int, default=55,
+                    help="Wrist-to-item distance (px) used by the goods-zone interaction check.")
+    ap.add_argument("--unknown_as_guest", action="store_true", default=False,
+                    help="Treat UNKNOWN persons as guests for stricter anti-theft behavior.")
+    ap.add_argument("--no_unknown_as_guest", dest="unknown_as_guest", action="store_false",
+                    help="Do not treat UNKNOWN persons as guests.")
+    ap.add_argument("--stable_pos_thresh", type=float, default=45.0,
+                    help="Max center-distance (px) for matching a new item detection to an existing stable item.")
     ap.add_argument("--stable_ghost_ttl",  type=float, default=3.0,
                     help="Ghost TTL for non-zone items only after they are no longer pinned.")
     ap.add_argument("--stable_pin_ttl", type=float, default=6.0,
@@ -1613,7 +1794,8 @@ def main():
                     help="Hits needed within --role_window_s to confirm an initial role label.")
     ap.add_argument("--role_window_s",      type=float, default=8.0,
                     help="Sliding window in seconds for role confirmation.")
-    ap.add_argument("--role_iou_thresh",    type=float, default=0.25)
+    ap.add_argument("--role_iou_thresh",    type=float, default=0.25,
+                    help="Minimum IoU between person box and role box when matching role detections to pose persons.")
     ap.add_argument("--role_switch_count",  type=int,   default=8,
                     help="Hits needed inside the window before switching STAFF↔GUEST.")
     ap.add_argument("--role_switch_min_conf", type=float, default=0.78,
@@ -1621,24 +1803,35 @@ def main():
     ap.add_argument("--role_switch_margin", type=int,   default=2,
                     help="New role must beat the current role by at least this many hits before switching.")
     # Legacy compat — kept so old scripts don't break
-    ap.add_argument("--role_confirm_frames", type=int, default=2)
-    ap.add_argument("--ha_url",       default="http://192.168.2.245:8123/")
-    ap.add_argument("--ha_token",     default="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI4Y2ZlYzc0MWFjMGM0OWFiYmFjOWU4YzM0ZTZiMDZkMyIsImlhdCI6MTc3MzIyMjQyNiwiZXhwIjoyMDg4NTgyNDI2fQ.G0mSeB_myjqozMUN8hXbVxNH6xr8eTzi1SWz-Qj_HRI")
-    ap.add_argument("--ha_webhook_id",   default="antitheft_alert")
-    ap.add_argument("--ha_snapshot_dir", default="www/snapshots")
+    ap.add_argument("--role_confirm_frames", type=int, default=2,
+                    help="Legacy compatibility arg only. Initial role confirmation now uses --role_confirm_count and --role_window_s.")
+    ap.add_argument("--ha_url",       default="http://192.168.2.245:8123/",
+                    help="Base URL of the Home Assistant instance that receives state updates.")
+    ap.add_argument("--ha_token",     default="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI4Y2ZlYzc0MWFjMGM0OWFiYmFjOWU4YzM0ZTZiMDZkMyIsImlhdCI6MTc3MzIyMjQyNiwiZXhwIjoyMDg4NTgyNDI2fQ.G0mSeB_myjqozMUN8hXbVxNH6xr8eTzi1SWz-Qj_HRI",
+                    help="Long-lived Home Assistant access token used for API calls.")
+    ap.add_argument("--ha_webhook_id",   default="antitheft_alert",
+                    help="Optional HA webhook ID triggered on each alert. Leave empty to disable webhook posts.")
+    ap.add_argument("--ha_snapshot_dir", default="www/snapshots",
+                    help="Local folder where snapshots/clips are first saved before optional HA upload.")
     ap.add_argument("--ha_upload_media", action="store_true", default=True,
                     help="Upload saved snapshot/clip into Home Assistant media so phones can open it remotely via HA.")
     ap.add_argument("--no_ha_upload_media", dest="ha_upload_media", action="store_false")
     ap.add_argument("--ha_media_dir", default="antitheft",
                     help="Optional subfolder inside HA /media. Leave empty to upload to /media root.")
-    ap.add_argument("--ha_clip_sec",  type=float, default=0.0)
-    ap.add_argument("--ha_cooldown",  type=float, default=15.0)
+    ap.add_argument("--ha_clip_sec",  type=float, default=0.0,
+                    help="Seconds of recent rendered frames to save as an alert clip. 0 disables clip recording.")
+    ap.add_argument("--ha_cooldown",  type=float, default=15.0,
+                    help="Minimum seconds between repeated HA notifications for the same entity.")
     ap.add_argument("--ha_alert_hold_sec", type=float, default=600.0,
                     help="Keep HA sensor state at ALERT for this many seconds after the last alert. New alerts extend the hold. 0 = clear immediately.")
-    ap.add_argument("--show_breakdown",  action="store_true")
-    ap.add_argument("--draw_items",      action="store_true")
-    ap.add_argument("--draw_fps",        action="store_true")
-    ap.add_argument("--draw_carry_ring", action="store_true")
+    ap.add_argument("--show_breakdown",  action="store_true",
+                    help="Show per-zone guest/staff/item breakdown in the overlay label.")
+    ap.add_argument("--draw_items",      action="store_true",
+                    help="Draw item boxes, ghost states, and role-detection boxes on the preview.")
+    ap.add_argument("--draw_fps",        action="store_true",
+                    help="Draw FPS metrics on the preview window.")
+    ap.add_argument("--draw_carry_ring", action="store_true",
+                    help="Draw wrist-centered carry-radius rings for debugging concealment logic.")
     # ── SAHI (Slicing Aided Hyper Inference) ──────────────────
     ap.add_argument("--sahi",            action="store_true", default=False,
                     help="Bật SAHI: chia frame thành tile nhỏ để detect vật thể nhỏ tốt hơn.")
