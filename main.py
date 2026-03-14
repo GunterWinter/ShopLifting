@@ -1,4 +1,5 @@
 import os, json, time, argparse, subprocess, threading, re, collections
+from urllib.parse import quote
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -19,18 +20,24 @@ class HomeAssistantNotifier:
     MAX_SNAPSHOT_FILES = 100
 
     def __init__(self, ha_url, token, zone_names=None, webhook_id="",
-                 snapshot_dir="", clip_duration_s=0.0, notify_cooldown_s=15.0):
+                 snapshot_dir="", clip_duration_s=0.0, notify_cooldown_s=15.0,
+                 upload_media=True, media_dir="", alert_hold_sec=600.0):
         self.ha_url            = ha_url.rstrip("/")
         self.webhook_id        = webhook_id
         self.snapshot_dir      = snapshot_dir
         self.clip_duration_s   = clip_duration_s
         self.notify_cooldown_s = notify_cooldown_s
+        self.upload_media      = bool(upload_media)
+        self.media_dir         = str(media_dir or "").strip().strip("/")
+        self.alert_hold_sec    = max(0.0, float(alert_hold_sec))
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type":  "application/json",
         }
         self._last_notify: dict = {}
         self._staged_media: dict = {}
+        self._alert_hold_until: dict = {}
+        self._pending_clear: set = set()
         if snapshot_dir and not os.path.exists(snapshot_dir):
             os.makedirs(snapshot_dir, exist_ok=True)
         self._frame_buf: collections.deque = collections.deque()
@@ -150,6 +157,69 @@ class HomeAssistantNotifier:
         writer.release()
         return path
 
+    def _sanitize_media_filename(self, filename):
+        base = os.path.basename(str(filename or "media.bin"))
+        safe = re.sub(r"[^a-zA-Z0-9._-]", "_", base)
+        return safe or "media.bin"
+
+    def _media_content_id_for_upload(self):
+        if self.media_dir:
+            return f"media-source://media_source/local/{self.media_dir}"
+        return "media-source://media_source/local"
+
+    def _media_content_id_to_relative_url(self, media_content_id):
+        prefix = "media-source://media_source/local"
+        if not media_content_id or not media_content_id.startswith(prefix):
+            return ""
+        suffix = media_content_id[len(prefix):].lstrip("/")
+        if not suffix:
+            return "/media/local"
+        parts = [quote(part) for part in suffix.split("/") if part]
+        return "/media/local/" + "/".join(parts)
+
+    def _upload_file_to_ha_media(self, local_path):
+        if not self._enabled or not self.upload_media or not local_path or not os.path.exists(local_path):
+            return ""
+
+        url = f"{self.ha_url}/api/media_source/local_source/upload"
+        target_media_id = self._media_content_id_for_upload()
+        filename = self._sanitize_media_filename(os.path.basename(local_path))
+        mime = "application/octet-stream"
+        lower = filename.lower()
+        if lower.endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif lower.endswith(".png"):
+            mime = "image/png"
+        elif lower.endswith(".gif"):
+            mime = "image/gif"
+        elif lower.endswith(".mp4"):
+            mime = "video/mp4"
+        elif lower.endswith(".mov"):
+            mime = "video/quicktime"
+        elif lower.endswith(".mp3"):
+            mime = "audio/mpeg"
+        elif lower.endswith(".wav"):
+            mime = "audio/wav"
+
+        try:
+            with open(local_path, "rb") as fp:
+                files = {"file": (filename, fp, mime)}
+                data = {"media_content_id": target_media_id}
+                headers = {"Authorization": self._headers.get("Authorization", "")}
+                r = _requests.post(url, headers=headers, data=data, files=files, timeout=20)
+            if not r.ok:
+                print(f"[HA] Media upload failed {r.status_code}: {r.text[:200]}")
+                return ""
+            payload = r.json() if r.content else {}
+            media_content_id = payload.get("media_content_id", "")
+            rel_url = self._media_content_id_to_relative_url(media_content_id)
+            if rel_url:
+                print(f"[HA] Uploaded media -> {rel_url}")
+            return rel_url
+        except Exception as e:
+            print(f"[HA] Media upload error: {e}")
+            return ""
+
     def _update_sensor(self, entity_id, state, attributes):
         url = f"{self.ha_url}/api/states/{entity_id}"
         try:
@@ -170,18 +240,61 @@ class HomeAssistantNotifier:
         except Exception as e:
             print(f"[HA] Webhook error: {e}")
 
+    def _entity_id_for_kind(self, kind):
+        return self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_", str(kind).lower())
+
+    def _friendly_name_for_kind(self, kind):
+        kind = str(kind or "")
+        if kind.startswith("zone_"):
+            return f"Anti-Theft Zone: {kind[5:]}"
+        return f"Anti-Theft: {kind}"
+
+    def _kind_from_entity_id(self, entity_id):
+        if entity_id.startswith(self.SENSOR_PREFIX):
+            return entity_id[len(self.SENSOR_PREFIX):]
+        return entity_id
+
+    def _write_ok_state(self, entity_id, now=None):
+        now = time.time() if now is None else now
+        kind = self._kind_from_entity_id(entity_id)
+        attrs = {
+            "friendly_name": self._friendly_name_for_kind(kind),
+            "message": "",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "snapshot": "",
+            "clip": "",
+            "snapshot_local": "",
+            "clip_local": "",
+        }
+        self._update_sensor(entity_id, "OK", attrs)
+
+    def process_pending_clears(self, now=None):
+        if not self._enabled:
+            return
+        now = time.time() if now is None else now
+        for entity_id in list(self._pending_clear):
+            hold_until = float(self._alert_hold_until.get(entity_id, 0.0) or 0.0)
+            if hold_until > 0.0 and now < hold_until:
+                continue
+            self._write_ok_state(entity_id, now=now)
+            self._pending_clear.discard(entity_id)
+            self._alert_hold_until.pop(entity_id, None)
+            print(f"[HA] Cleared alert -> {entity_id}")
+
     def send_alert(self, kind, message, frame, now, use_staged_snapshot=False,
                    snapshot_path=""):
         if not self._enabled: return
-        entity_id = self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_", kind.lower())
+        entity_id = self._entity_id_for_kind(kind)
         last = self._last_notify.get(entity_id, 0.0)
         if (now - last) < self.notify_cooldown_s:
             return
         self._last_notify[entity_id] = now
+        self._pending_clear.discard(entity_id)
         snap_path = clip_path = ""
+        snap_url = clip_url = ""
 
         def _save_media():
-            nonlocal snap_path, clip_path
+            nonlocal snap_path, clip_path, snap_url, clip_url
             chosen = ""
             if snapshot_path and os.path.exists(snapshot_path):
                 chosen = snapshot_path
@@ -191,27 +304,41 @@ class HomeAssistantNotifier:
                 chosen = self._save_snapshot(frame, kind)
             snap_path = chosen
             clip_path = self._save_clip(kind)
+            snap_url = self._upload_file_to_ha_media(snap_path) if snap_path else ""
+            clip_url = self._upload_file_to_ha_media(clip_path) if clip_path else ""
 
         t = threading.Thread(target=_save_media, daemon=True)
-        t.start(); t.join(timeout=10)
+        t.start(); t.join(timeout=20)
         attrs = {
-            "friendly_name": f"Anti-Theft: {kind}", "message": message,
+            "friendly_name": self._friendly_name_for_kind(kind), "message": message,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-            "snapshot": snap_path, "clip": clip_path,
+            "snapshot": snap_url or snap_path, "clip": clip_url or clip_path,
+            "snapshot_local": snap_path, "clip_local": clip_path,
         }
         self._update_sensor(entity_id, "ALERT", attrs)
+        self._alert_hold_until[entity_id] = now + self.alert_hold_sec
         self._fire_webhook({"type": kind, "message": message,
+                            "snapshot": snap_url or snap_path,
+                            "clip": clip_url or clip_path,
                             "snapshot_path": snap_path, "clip_path": clip_path,
                             "timestamp": attrs["timestamp"]})
-        print(f"[HA] Sent alert -> {entity_id}  snap={snap_path} clip={clip_path}")
+        hold_txt = (f" hold_until={time.strftime('%H:%M:%S', time.localtime(self._alert_hold_until.get(entity_id, now)))}"
+                    if self.alert_hold_sec > 0 else "")
+        print(f"[HA] Sent alert -> {entity_id}  snap={snap_url or snap_path} clip={clip_url or clip_path}{hold_txt}")
 
-    def clear_alert(self, kind):
+    def clear_alert(self, kind, now=None):
         self.discard_staged(kind)
-        if not self._enabled: return
-        entity_id = self.SENSOR_PREFIX + re.sub(r"[^a-zA-Z0-9_]", "_", kind.lower())
-        attrs = {"friendly_name": f"Anti-Theft: {kind}", "message": "",
-                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "snapshot": "", "clip": ""}
-        self._update_sensor(entity_id, "OK", attrs)
+        if not self._enabled:
+            return
+        now = time.time() if now is None else now
+        entity_id = self._entity_id_for_kind(kind)
+        hold_until = float(self._alert_hold_until.get(entity_id, 0.0) or 0.0)
+        self._pending_clear.add(entity_id)
+        if hold_until > 0.0 and now < hold_until:
+            remain = hold_until - now
+            print(f"[HA] Hold ALERT -> {entity_id} for {remain:.1f}s more before OK")
+            return
+        self.process_pending_clears(now=now)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -571,21 +698,25 @@ class PersonRoleTracker:
 # StableItemTracker — PINNED ZONE ITEMS
 #
 # Items detected inside goods zones become "pinned":
-#   - Pinned items are NEVER auto-expired by ghost_ttl.
-#   - When occluded (det_model stops seeing them), they stay in the
-#     stable_items list as ghost=True, pinned=True.  Their bbox and ID
-#     are drawn on screen with a dashed border.
+#   - Pinned items stay ghost-drawn when briefly lost by det_model.
+#   - If --stable_pin_ttl <= 0, pinning is infinite (legacy behavior).
+#   - If --stable_pin_ttl > 0, a pinned item is only kept pinned while
+#     the gap since its last re-detection is <= stable_pin_ttl seconds.
+#     After that it is unpinned to avoid weak / one-off detections
+#     sticking forever.
 #   - When re-detected after occlusion ends, they are refreshed
 #     (ghost=False) by the spatial proximity match as usual.
-#   - They are only removed when remove_zone_ghosts() is called
-#     explicitly after theft is confirmed by GoodsZoneGuard.
+#   - They are still removed immediately by remove_zone_ghosts() after
+#     theft is confirmed by GoodsZoneGuard.
 #
 # Non-zone items: unchanged — expire after ghost_ttl seconds.
 # ─────────────────────────────────────────────────────────────
 class StableItemTracker:
-    def __init__(self, pos_thresh: float = 45.0, ghost_ttl: float = 3.0):
+    def __init__(self, pos_thresh: float = 45.0, ghost_ttl: float = 3.0,
+                 pin_ttl: float = 0.0):
         self.pos_thresh = float(pos_thresh)
         self.ghost_ttl  = float(ghost_ttl)
+        self.pin_ttl    = float(pin_ttl)
         self._reg: dict = {}
         self._next_sid  = 1
 
@@ -597,7 +728,7 @@ class StableItemTracker:
             "conf":      float(it.get("conf", 0.5)),
             "last_seen": now,
             "ghost":     False,
-            "pinned":    False,   # True = zone item, never auto-expires
+            "pinned":    False,
         }
 
     def _best_pos_match(self, cx: float, cy: float, used: set):
@@ -619,7 +750,7 @@ class StableItemTracker:
         detected       : raw items from det_model this frame
         now            : time.time()
         goods_zones_px : pixel-space goods zones; items inside these zones
-                         get pinned (infinite ghost TTL)
+                         get pinned (respecting --stable_pin_ttl)
 
         Returns (stable_items, real_items):
           stable_items : real + ghost/pinned  (zone count + display)
@@ -674,8 +805,10 @@ class StableItemTracker:
             rec = self._reg[sid]
             age = now - rec["last_seen"]
 
+            if rec["pinned"] and self.pin_ttl > 0 and age > self.pin_ttl:
+                rec["pinned"] = False
+
             if rec["pinned"]:
-                # Pinned zone item: NEVER expires → always ghost-drawn
                 rec["ghost"] = True
                 ghost_items.append({
                     "bbox":     rec["bbox"],
@@ -1446,11 +1579,11 @@ def main():
     ap.add_argument("--det_model",  required=True)
     ap.add_argument("--pose_model", required=True)
     ap.add_argument("--imgsz",     type=int,   default=640)
-    ap.add_argument("--conf_det",  type=float, default=0.1,
+    ap.add_argument("--conf_det",  type=float, default=0.4,
                     help="Confidence threshold for det_model items (default 0.4)")
-    ap.add_argument("--conf_role", type=float, default=0.72,
+    ap.add_argument("--conf_role", type=float, default=0.8,
                     help="Confidence threshold for staff/guest detections. Raise this when staff sometimes flips to guest (default 0.72).")
-    ap.add_argument("--conf_pose", type=float, default=0.4)
+    ap.add_argument("--conf_pose", type=float, default=0.1)
     ap.add_argument("--ffmpeg_path",  default="ffmpeg")
     ap.add_argument("--ffprobe_path", default="ffprobe")
     ap.add_argument("--out_width",  type=int,   default=0)
@@ -1464,7 +1597,7 @@ def main():
     ap.add_argument("--move_thresh",  type=int,   default=18)
     ap.add_argument("--grasp_dist",   type=int,   default=24)
     ap.add_argument("--conceal_verify_sec", type=float, default=1.2)
-    ap.add_argument("--cooldown_sec", type=float, default=3)
+    ap.add_argument("--cooldown_sec", type=float, default=4)
     ap.add_argument("--exit_settle_sec", type=float, default=0.5)
     ap.add_argument("--goods_zone_names", default="zone1,zone2")
     ap.add_argument("--guest_reach_dist", type=int, default=55)
@@ -1472,14 +1605,16 @@ def main():
     ap.add_argument("--no_unknown_as_guest", dest="unknown_as_guest", action="store_false")
     ap.add_argument("--stable_pos_thresh", type=float, default=45.0)
     ap.add_argument("--stable_ghost_ttl",  type=float, default=3.0,
-                    help="Ghost TTL for non-zone items only. Zone items are pinned forever.")
+                    help="Ghost TTL for non-zone items only after they are no longer pinned.")
+    ap.add_argument("--stable_pin_ttl", type=float, default=6.0,
+                    help="Pinned TTL for goods-zone items. 0 = pin forever. >0 = unpin when not re-detected for this many seconds.")
     # NEW role-tracker params
     ap.add_argument("--role_confirm_count", type=int,   default=4,
                     help="Hits needed within --role_window_s to confirm an initial role label.")
     ap.add_argument("--role_window_s",      type=float, default=8.0,
                     help="Sliding window in seconds for role confirmation.")
     ap.add_argument("--role_iou_thresh",    type=float, default=0.25)
-    ap.add_argument("--role_switch_count",  type=int,   default=7,
+    ap.add_argument("--role_switch_count",  type=int,   default=8,
                     help="Hits needed inside the window before switching STAFF↔GUEST.")
     ap.add_argument("--role_switch_min_conf", type=float, default=0.78,
                     help="Average confidence needed before switching STAFF↔GUEST.")
@@ -1491,8 +1626,15 @@ def main():
     ap.add_argument("--ha_token",     default="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI4Y2ZlYzc0MWFjMGM0OWFiYmFjOWU4YzM0ZTZiMDZkMyIsImlhdCI6MTc3MzIyMjQyNiwiZXhwIjoyMDg4NTgyNDI2fQ.G0mSeB_myjqozMUN8hXbVxNH6xr8eTzi1SWz-Qj_HRI")
     ap.add_argument("--ha_webhook_id",   default="antitheft_alert")
     ap.add_argument("--ha_snapshot_dir", default="www/snapshots")
+    ap.add_argument("--ha_upload_media", action="store_true", default=True,
+                    help="Upload saved snapshot/clip into Home Assistant media so phones can open it remotely via HA.")
+    ap.add_argument("--no_ha_upload_media", dest="ha_upload_media", action="store_false")
+    ap.add_argument("--ha_media_dir", default="antitheft",
+                    help="Optional subfolder inside HA /media. Leave empty to upload to /media root.")
     ap.add_argument("--ha_clip_sec",  type=float, default=0.0)
     ap.add_argument("--ha_cooldown",  type=float, default=15.0)
+    ap.add_argument("--ha_alert_hold_sec", type=float, default=600.0,
+                    help="Keep HA sensor state at ALERT for this many seconds after the last alert. New alerts extend the hold. 0 = clear immediately.")
     ap.add_argument("--show_breakdown",  action="store_true")
     ap.add_argument("--draw_items",      action="store_true")
     ap.add_argument("--draw_fps",        action="store_true")
@@ -1553,6 +1695,7 @@ def main():
     stable_tracker = StableItemTracker(
         pos_thresh = args.stable_pos_thresh,
         ghost_ttl  = args.stable_ghost_ttl,
+        pin_ttl    = args.stable_pin_ttl,
     )
 
     track_buf    = TrackBuffer(ghost_frames=6)
@@ -1570,7 +1713,9 @@ def main():
           f"{args.role_window_s}s window  |  switch={args.role_switch_count} hits @ avg_conf>={args.role_switch_min_conf:.2f} "
           f"| unknown_as_guest={args.unknown_as_guest}")
     print(f"[CONFIG] conf_det={args.conf_det} (items)  conf_role={args.conf_role} (staff/guest)")
+    print(f"[CONFIG] stable_ghost_ttl={args.stable_ghost_ttl}s  stable_pin_ttl={args.stable_pin_ttl}s (0=forever)")
     print(f"[CONFIG] zone settle={args.exit_settle_sec}s  verify={args.cooldown_sec}s  conceal_verify={args.conceal_verify_sec}s  grasp_dist={args.grasp_dist}px")
+    print(f"[CONFIG] HA alert hold={args.ha_alert_hold_sec}s  notify cooldown={args.ha_cooldown}s")
 
     ha = HomeAssistantNotifier(
         ha_url            = args.ha_url,
@@ -1580,6 +1725,9 @@ def main():
         snapshot_dir      = args.ha_snapshot_dir,
         clip_duration_s   = args.ha_clip_sec,
         notify_cooldown_s = args.ha_cooldown,
+        upload_media      = args.ha_upload_media,
+        media_dir         = args.ha_media_dir,
+        alert_hold_sec     = args.ha_alert_hold_sec,
     )
 
     _prev_alerting_zones: set = set()
@@ -2033,6 +2181,7 @@ def main():
             # Alert messages stay in console / Home Assistant only.
 
             # ── Home Assistant ─────────────────────────────────────────────
+            ha.process_pending_clears(now=now)
             curr_alerting_zones = {
                 zname for zname, g in zone_guards.items()
                 if g is not None and g.is_alerting
@@ -2043,7 +2192,7 @@ def main():
                               frame=clean_frame.copy(), now=now,
                               use_staged_snapshot=True)
             for zname in (_prev_alerting_zones - curr_alerting_zones):
-                ha.clear_alert(f"zone_{zname}")
+                ha.clear_alert(f"zone_{zname}", now=now)
             _prev_alerting_zones = curr_alerting_zones
 
             curr_conceal_count = len(conceal.alerts)
